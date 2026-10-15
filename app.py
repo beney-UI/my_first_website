@@ -762,12 +762,38 @@ def _clock(minutes: int) -> str:
     return f"{(minutes // 60) % 24:02d}:{minutes % 60:02d}"
 
 
-def _schedule_for_day(activities: list[dict], transport: str, start_hour: int, pace: str) -> tuple[list[dict], int, int]:
+# 6-18: 첫날 도착, 마지막 날 출발, 숙소 기준 이동시간을 반영합니다.
+@st.cache_data(ttl=3600, show_spinner=False)
+def _lodging_candidates(query: str, destination: str, api_key: str) -> list[dict]:
+    if not query.strip() or not api_key:
+        return []
+    params = {"query": (destination + " " + query).strip(), "size": 10}
+    try:
+        request = Request(
+            "https://dapi.kakao.com/v2/local/search/keyword.json?" + urlencode(params),
+            headers={"Authorization": f"KakaoAK {api_key}"},
+        )
+        with urlopen(request, timeout=7) as response:
+            docs = json.load(response).get("documents", [])
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        return []
+    return [
+        {"name": d.get("place_name", ""),
+         "address": d.get("road_address_name") or d.get("address_name", ""),
+         "latitude": str(d.get("y", "")), "longitude": str(d.get("x", ""))}
+        for d in docs if d.get("x") and d.get("y")
+    ]
+
+
+def _schedule_for_day(
+    activities: list[dict], transport: str, start_hour: int, pace: str,
+    start_anchor: dict | None = None, end_anchor: dict | None = None,
+) -> tuple[list[dict], int, int]:
     visits = [a for a in activities if a.get("type") in ("관광", "식사", "점심 식사", "저녁 식사", "카페·휴식")]
     current = start_hour * 60
     rows = []
     travel_total = 0
-    previous = None
+    previous = start_anchor
     for activity in visits:
         if previous is not None:
             transfer, basis = _estimated_transfer_minutes(previous, activity, transport)
@@ -780,40 +806,94 @@ def _schedule_for_day(activities: list[dict], transport: str, start_hour: int, p
                      "장소/활동": activity.get("name", ""), "소요": f"약 {stay}분", "비고": "체류시간 가정"})
         current += stay
         previous = activity
+    if previous is not None and end_anchor is not None:
+        transfer, basis = _estimated_transfer_minutes(previous, end_anchor, transport)
+        rows.append({"시간": f"{_clock(current)}–{_clock(current + transfer)}", "구분": "이동 (추정)",
+                     "장소/활동": f"{previous.get('name', '')} → {end_anchor.get('name', '')}",
+                     "소요": f"약 {transfer}분", "비고": basis})
+        current += transfer
+        travel_total += transfer
     return rows, current, travel_total
 
 
-def render_time_schedule(itinerary: list, transport: str) -> None:
+def render_time_schedule(itinerary: list, transport: str, destination: str = "") -> None:
     st.markdown("#### 예상 시간표 · 일정 현실성 점검")
-    st.caption("선택한 일정의 방문 순서를 기준으로 체류시간과 이동시간을 추정합니다. 실제 도로·버스 노선, 영업시간, 예약시간은 확인하지 않습니다.")
+    st.caption("6-18: 첫날 도착·마지막 날 출발·숙소 이동을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
     a, b, c = st.columns(3)
     with a:
-        start_hour = st.selectbox("하루 시작 시각", list(range(7, 13)), index=2, format_func=lambda h: f"{h:02d}:00", key="trip_617_start")
+        start_hour = st.selectbox("중간 날짜 출발 시각", list(range(7, 13)), index=2,
+                                  format_func=lambda h: f"{h:02d}:00", key="trip_617_start")
     with b:
-        end_hour = st.selectbox("하루 종료 희망 시각", list(range(16, 24)), index=4, format_func=lambda h: f"{h:02d}:00", key="trip_617_end")
+        end_hour = st.selectbox("중간 날짜 종료 희망 시각", list(range(16, 24)), index=4,
+                                format_func=lambda h: f"{h:02d}:00", key="trip_617_end")
     with c:
         pace = st.selectbox("여행 속도", ["여유롭게", "보통", "빠르게"], index=1, key="trip_617_pace")
     if start_hour >= end_hour:
-        st.warning("종료 희망 시각을 시작 시각보다 늦게 선택해 주세요.")
+        st.warning("중간 날짜의 종료 시각을 시작 시각보다 늦게 선택해 주세요.")
         return
+
+    first_col, last_col = st.columns(2)
+    with first_col:
+        arrival = st.selectbox("첫날 여행지 도착 예정 시각", list(range(7, 23)), index=6,
+                               format_func=lambda h: f"{h:02d}:00", key="trip_618_arrival")
+    with last_col:
+        departure = st.selectbox("마지막 날 귀가 출발 예정 시각", list(range(8, 24)), index=7,
+                                 format_func=lambda h: f"{h:02d}:00", key="trip_618_departure")
+
+    lodging = None
+    if len(itinerary) > 1:
+        with st.expander("숙소 위치 설정 (선택)", expanded=False):
+            lodging_query = st.text_input("숙소 이름 또는 주소", key="trip_618_lodging_query",
+                                          placeholder="예: 제주 ○○호텔")
+            st.caption("숙소를 입력하면 카카오 장소 검색 결과에서 정확한 숙소를 선택할 수 있습니다. 예약이나 영업 여부는 확인하지 않습니다.")
+            if lodging_query.strip():
+                candidates = _lodging_candidates(lodging_query.strip(), destination, get_kakao_api_key())
+                if candidates:
+                    selected = st.selectbox("숙소 검색 결과", range(len(candidates)),
+                                            format_func=lambda i: f"{candidates[i]['name']} · {candidates[i]['address']}",
+                                            key="trip_618_lodging_selection")
+                    lodging = candidates[selected]
+                    st.success("숙소 위치를 중간 날짜 출발·복귀 이동시간에 반영합니다.")
+                else:
+                    st.warning("숙소를 찾지 못했습니다. 숙소 이동시간을 제외한 시간표를 표시합니다.")
+    if not itinerary:
+        return
+    final_day = itinerary[-1][0]
     for day, activities in itinerary:
-        rows, finish, travel = _schedule_for_day(activities, transport, start_hour, pace)
-        if not rows:
-            st.info(f"{day}일 차: 방문 장소가 없어 시간표를 만들 수 없습니다.")
-            continue
-        with st.expander(f"{day}일 차 · 예상 종료 {_clock(finish)} · 이동 약 {travel}분", expanded=(day == 1)):
+        is_first = day == itinerary[0][0]
+        is_last = day == final_day
+        day_start = arrival if is_first else start_hour
+        day_end = departure if is_last else end_hour
+        # 숙소를 선택했다면 첫날 관광 후 숙소까지, 중간 날은 숙소 왕복,
+        # 마지막 날은 숙소에서 첫 관광지까지의 이동을 포함합니다.
+        from_lodging = lodging if lodging and not is_first else None
+        to_lodging = lodging if lodging and not is_last else None
+        rows, finish, travel = _schedule_for_day(activities, transport, day_start, pace,
+                                                  start_anchor=from_lodging, end_anchor=to_lodging)
+        title = f"{day}일 차 · 예상 종료 {_clock(finish)} · 이동 약 {travel}분"
+        with st.expander(title, expanded=is_first):
+            if is_first:
+                st.caption(f"첫날 여행지 도착 {day_start:02d}:00부터 시작합니다.")
+            if is_last:
+                st.caption(f"마지막 날 귀가 출발 {day_end:02d}:00 전 일정 종료를 목표로 합니다.")
+            if not rows:
+                st.info("방문 장소가 없어 시간표를 만들 수 없습니다.")
+                continue
             st.dataframe(rows, hide_index=True, use_container_width=True)
-            if finish > end_hour * 60:
-                st.warning(f"희망 종료 시각보다 약 {finish - end_hour * 60}분 늦습니다. 방문 장소를 줄이거나 시작 시각을 조정하세요.")
-            elif finish > end_hour * 60 - 30:
-                st.info("종료 시각까지 여유가 30분 미만입니다. 휴식·주차·대기시간을 추가로 고려하세요.")
+            if finish > day_end * 60:
+                st.warning(f"{'귀가 출발' if is_last else '희망 종료'} 시각보다 약 {finish - day_end * 60}분 초과합니다. 장소를 줄이거나 순서를 조정하세요.")
+            elif finish > day_end * 60 - 30:
+                st.info("종료까지 여유가 30분 미만입니다. 주차·대기·휴식을 추가로 고려하세요.")
             else:
-                st.success(f"희망 종료 시각까지 약 {end_hour * 60 - finish}분의 여유가 있습니다(추정 기준).")
+                st.success(f"목표 종료시각까지 약 {day_end * 60 - finish}분 여유가 있습니다(추정 기준).")
             if travel >= 120:
                 st.warning("하루 이동시간이 2시간 이상으로 추정됩니다. 동선을 조정하는 것이 좋습니다.")
             if not any(a.get("type") in ("점심 식사", "저녁 식사", "식사") for a in activities):
                 st.warning("식사 장소가 없습니다.")
-            st.caption("시간표는 일정 편집 시 자동 재계산됩니다. 숙소 출발·복귀, 입장 대기, 교통 체증, 실제 운영시간은 미포함입니다.")
+            if is_last:
+                st.caption("귀가 출발시각은 여행지에서 귀가를 시작하는 시각입니다. 공항·역 이동 및 수속시간은 별도로 고려하세요.")
+            st.caption("일정 편집 시 자동 재계산됩니다. 도로·버스 경로, 실시간 교통, 영업시간, 숙소 체크인 가능시간은 미확인입니다.")
+    st.info("숙소는 시간표의 출발·복귀 이동 추정에 반영됩니다. 관광지 추천 순서 자체는 변경하지 않습니다.")
 
 
 EDITABLE_PLACE_TYPES = {"관광", "식사", "점심 식사", "저녁 식사", "카페·휴식"}
@@ -2144,7 +2224,7 @@ if search_result:
             st.session_state.trip_edit_last_change = ""
         location_itinerary = st.session_state.trip_editable_itinerary
         render_editable_itinerary(location_itinerary)
-        render_time_schedule(location_itinerary, selected_transport)
+        render_time_schedule(location_itinerary, selected_transport, query)
         with st.expander("일정 추천 품질 점검", expanded=False):
             st.caption("방문 장소 중복·긴 직선 이동·식사 누락을 점검합니다. 실제 도로 경로, 영업시간, 리뷰 평점은 검증하지 않습니다.")
             quality_notes = _itinerary_quality_notes(location_itinerary, selected_transport)
