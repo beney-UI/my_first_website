@@ -122,11 +122,58 @@ def companion_for_media(party: str, child_group: str | None) -> str:
 
 
 def attractions_per_day_for(party: str, style: str, child_group: str | None) -> int:
-    if party in ("부모님과 여행", "3대 가족 여행"):
-        return 1
-    if child_group and "영유아 (0~5세)" in child_group:
-        return 1
-    return 1 if style in ("휴식 중심", "맛집 중심") else 2
+    """스타일별 관광지 목표 수. 영유아·부모님 동행은 방문 부담을 줄입니다."""
+    if style == "관광 중심":
+        count = 3
+    elif style == "체험 중심":
+        count = 2
+    else:
+        count = 1
+    if party in ("부모님과 여행", "3대 가족 여행") or (child_group and "영유아 (0~5세)" in child_group):
+        count = min(count, 2 if style in ("관광 중심", "체험 중심") else 1)
+    return count
+
+
+STYLE_NAMES = ("관광 중심", "휴식 중심", "맛집 중심", "체험 중심")
+
+
+def style_components(style: str) -> list[str]:
+    """기존 단일 스타일과 신규 복합 스타일 모두 지원."""
+    return [part.strip() for part in style.split(" + ") if part.strip()]
+
+
+def combined_style_plan(style: str, party: str, child_group: str | None) -> dict:
+    """주요/보조 스타일별 목표 개수. 실제 후보가 부족하면 더 적게 표시."""
+    parts = style_components(style)
+    main = parts[0] if parts else "관광 중심"
+    secondary = parts[1] if len(parts) > 1 else None
+    if secondary is None:
+        return {"attractions": attractions_per_day_for(party, main, child_group),
+                "foods": 2 if main == "맛집 중심" else 1,
+                "cafes": 2 if main == "휴식 중심" else 1,
+                "experience": main == "체험 중심"}
+    attractions = 2 if "관광 중심" in parts or "체험 중심" in parts else 1
+    if main == "관광 중심" and secondary == "체험 중심":
+        attractions = 3
+    if main == "체험 중심" and secondary == "관광 중심":
+        attractions = 3
+    if party in ("부모님과 여행", "3대 가족 여행") or (child_group and "영유아 (0~5세)" in child_group):
+        attractions = min(attractions, 2)
+    return {"attractions": attractions,
+            "foods": 2 if "맛집 중심" in parts else 1,
+            "cafes": 2 if "휴식 중심" in parts else 1,
+            "experience": "체험 중심" in parts}
+
+
+EXPERIENCE_KEYWORDS = ("체험", "공방", "만들기", "승마", "목장", "농장", "박물관", "과학관", "전시", "액티비티", "레저", "수족관", "아쿠아리움", "테마파크", "쿠킹", "도예", "교육")
+
+
+def prioritize_experiences(places: list[Place]) -> list[Place]:
+    """실제 관광지 후보 내에서 체험 관련 명칭·설명이 있는 곳을 우선합니다."""
+    return [p for _, p in sorted(enumerate(places), key=lambda item: (
+        -sum(1 for word in EXPERIENCE_KEYWORDS if word in " ".join(str(item[1].get(k) or "") for k in ("name", "category", "description"))),
+        item[0],
+    ))]
 
 
 def party_place_score(place: Place, party: str, child_group: str | None) -> int:
@@ -474,109 +521,84 @@ def build_location_itinerary(
     party: str = "혼자 여행", child_group: str | None = None, destination: str = ""
 ) -> list[tuple[int, list[dict[str, str]]]]:
     days = duration_to_days(duration)
-    attractions_per_day = attractions_per_day_for(party, travel_style, child_group)
+    plan = combined_style_plan(travel_style, party, child_group)
+    attractions_per_day = plan["attractions"]
+    groups = _cluster_attraction_groups(groups, attractions_per_day)
     itinerary = []
     group_index = 0
-    groups = _cluster_attraction_groups(groups, attractions_per_day)
     used_food: set[str] = set()
     used_cafes: set[str] = set()
 
     for day in range(1, days + 1):
-        day_groups = groups[group_index : group_index + attractions_per_day]
+        day_groups = groups[group_index:group_index + attractions_per_day]
         group_index += len(day_groups)
         activities: list[dict[str, str]] = []
 
         def add_activity(kind: str, place: Place, fallback_reason: str) -> None:
             name = str(place.get("name") or "장소 정보 없음")
             address = str(place.get("address") or "주소 정보가 제공되지 않았습니다.")
-            map_query = quote(" ".join(part for part in (name, address) if part))
-            url = str(place.get("detail_url") or f"https://map.kakao.com/link/search/{map_query}")
+            url = str(place.get("detail_url") or f"https://map.kakao.com/link/search/{quote(name + ' ' + address)}")
             reason = str(place.get("recommendation_reason") or fallback_reason)
-            distance = place.get("distance_meters")
-            if distance is not None:
-                reason += f" 직선거리 참고 약 {distance}m이며 실제 경로·이동시간은 확인되지 않았습니다."
-            activity = {
-                "type": kind,
-                "name": name,
-                "address": address,
-                "reason": reason,
-                "url": url,
-            }
-            coordinates = _valid_map_coordinates(place)
-            if coordinates is not None:
-                activity["latitude"] = str(coordinates[0])
-                activity["longitude"] = str(coordinates[1])
+            if place.get("distance_meters") is not None:
+                reason += f" 직선거리 참고 약 {place['distance_meters']}m이며 실제 경로·이동시간은 확인되지 않았습니다."
+            activity = {"type": kind, "name": name, "address": address, "reason": reason, "url": url}
+            coords = _valid_map_coordinates(place)
+            if coords is not None:
+                activity["latitude"], activity["longitude"] = map(str, coords)
             activities.append(activity)
 
         if day_groups:
-            first_group = day_groups[0]
-            add_activity(
-                "관광",
-                first_group["attraction"],
-                "한국관광공사 관광지 검색 결과입니다.",
-            )
-            first_restaurants = [place for group in day_groups for place in group.get("restaurants", [])]
-            regional_restaurants = _extra_thematic_candidates(first_group["attraction"], destination, "food")
-            lunch, lunch_matched = _select_thematic_nearby(regional_restaurants + first_restaurants, first_group["attraction"], used_food, "food", destination)
-            if lunch:
-                add_activity("점심 식사", lunch, "지역 대표 음식 키워드가 장소 정보에서 확인된 후보입니다. 메뉴·맛·영업시간은 별도 확인이 필요합니다." if lunch_matched else "지역 대표 음식 후보를 찾지 못해 이동 동선상 가까운 음식점을 배치했습니다. 메뉴·영업시간은 확인이 필요합니다.")
-            elif first_group.get("attraction"):
-                activities.append({
-                    "type": "식사",
-                    "name": "주변 장소 검색 결과 없음",
-                    "address": "",
-                    "reason": "관광지 주변에서 확인된 음식점이 없습니다.",
-                    "url": "",
-                })
+            attractions = [g["attraction"] for g in day_groups]
+            restaurants = [p for g in day_groups for p in g.get("restaurants", [])]
+            cafes = [p for g in day_groups for p in g.get("cafes", [])]
+            first = attractions[0]
+            last = attractions[-1]
+            regional_food = _extra_thematic_candidates(first, destination, "food")
+            mood_cafes = _extra_thematic_candidates(last, destination, "cafe")
+            food_candidates = regional_food + restaurants
+            cafe_candidates = mood_cafes + cafes
 
-            if len(day_groups) > 1:
-                second_group = day_groups[1]
-                add_activity(
-                    "관광",
-                    second_group["attraction"],
-                    "한국관광공사 관광지 검색 결과입니다.",
-                )
+            def add_food(anchor: dict, kind: str) -> dict | None:
+                place, matched = _select_thematic_nearby(food_candidates, anchor, used_food, "food", destination)
+                if place:
+                    reason = ("지역 대표 음식 키워드가 확인된 후보입니다." if matched else
+                              "지역 음식 후보가 부족해 동선상 가까운 음식점을 선택했습니다.")
+                    add_activity(kind, place, reason + " 메뉴·영업시간은 확인이 필요합니다.")
+                return place
 
-            cafes = [place for group in day_groups for place in group.get("cafes", [])]
-            last_attraction = day_groups[-1]["attraction"]
-            mood_cafes = _extra_thematic_candidates(last_attraction, destination, "cafe")
-            cafe, cafe_matched = _select_thematic_nearby(mood_cafes + cafes, last_attraction, used_cafes, "cafe", destination)
-            if cafe:
-                add_activity("카페·휴식", cafe, "감성·전망·디저트 관련 키워드가 장소 정보에서 확인된 카페 후보입니다. 실제 분위기·영업시간은 확인이 필요합니다." if cafe_matched else "감성 키워드 후보가 없어 이동 동선상 가까운 카페를 배치했습니다. 실제 분위기·영업시간은 확인이 필요합니다.")
-                if travel_style == "휴식 중심":
-                    extra_cafe, _ = _select_thematic_nearby(mood_cafes + cafes, cafe, used_cafes, "cafe", destination)
-                    if extra_cafe:
-                        add_activity("카페·휴식", extra_cafe, "첫 카페와 가까운 추가 휴식 장소 후보입니다.")
-            else:
-                activities.append({
-                    "type": "카페·휴식",
-                    "name": "주변 장소 검색 결과 없음",
-                    "address": "",
-                    "reason": "관광지 주변에서 확인된 카페가 없습니다.",
-                    "url": "",
-                })
+            def add_cafe(anchor: dict) -> dict | None:
+                place, matched = _select_thematic_nearby(cafe_candidates, anchor, used_cafes, "cafe", destination)
+                if place:
+                    reason = ("감성·전망·디저트 키워드가 확인된 카페 후보입니다." if matched else
+                              "감성 키워드 후보가 부족해 동선상 가까운 카페를 선택했습니다.")
+                    add_activity("카페·휴식", place, reason + " 실제 분위기·영업시간은 확인이 필요합니다.")
+                return place
 
-            if travel_style == "맛집 중심":
-                dinner_anchor = cafe or last_attraction
-                dinner, dinner_matched = _select_thematic_nearby(regional_restaurants + first_restaurants, dinner_anchor, used_food, "food", destination)
-                if dinner:
-                    add_activity("저녁 식사", dinner, "지역 대표 음식 키워드가 확인된 저녁 식사 후보입니다. 메뉴·저녁 영업 여부는 확인이 필요합니다." if dinner_matched else "이동 동선상 가까운 저녁 식사 후보입니다. 메뉴·영업시간은 확인이 필요합니다.")
+            # 주요 스타일은 관광지 순서, 보조 스타일은 음식점/카페 비중에 반영합니다.
+            add_activity("관광", first, "여행 조건에 맞춰 선정한 관광지입니다.")
+            lunch = add_food(first, "점심 식사")
+            for attraction in attractions[1:]:
+                add_activity("관광", attraction,
+                             "체험형 장소 후보입니다. 실제 체험 운영 여부는 확인이 필요합니다." if plan["experience"]
+                             else "관광지 간 거리와 여행 스타일을 고려한 장소입니다.")
+            cafe_anchor = last if len(attractions) > 1 else (lunch or first)
+            cafe = add_cafe(cafe_anchor)
+            if plan["cafes"] > 1:
+                add_cafe(cafe or cafe_anchor)
+            if plan["foods"] > 1:
+                add_food(cafe or last, "저녁 식사")
 
-        if not day_groups:
-            activities.append({
-                "type": "안내",
-                "name": "추가 장소 필요",
-                "address": "",
-                "reason": "이 날짜에 배치할 실제 관광지 검색 결과가 부족합니다. 장소 검색에서 원하는 곳을 직접 추가해 주세요.",
-                "url": "",
-            })
+            # 검색 결과가 부족해 음식점·카페가 누락되면 안내를 표시합니다.
+            if not any(a["type"] in ("식사", "점심 식사", "저녁 식사") for a in activities):
+                activities.append({"type": "안내", "name": "음식점 후보 부족", "address": "", "reason": "주변 음식점 검색 결과가 없습니다. 직접 추가해 주세요.", "url": ""})
+            if not any(a["type"] == "카페·휴식" for a in activities):
+                activities.append({"type": "안내", "name": "카페 후보 부족", "address": "", "reason": "주변 카페 검색 결과가 없습니다. 직접 추가해 주세요.", "url": ""})
+        else:
+            activities.append({"type": "안내", "name": "추가 장소 필요", "address": "", "reason": "해당 날짜에 배치할 관광지가 부족합니다. 장소 검색에서 직접 추가해 주세요.", "url": ""})
 
         activities.append({
-            "type": "이동 참고",
-            "name": transport,
-            "address": "",
-            "reason": "동행자별 추천 우선순위를 유지하면서 같은 날짜의 가까운 관광지를 묶고, 관광지 주변 식사·휴식 장소를 배치했습니다. 직선거리 기반 추정으로 실제 도로·대중교통 경로, 소요시간, 영업시간은 확인되지 않았습니다.",
-            "url": "",
+            "type": "이동 참고", "name": transport, "address": "", "url": "",
+            "reason": f"{travel_style} 기준으로 구성한 일정입니다. 관광지 간 거리는 직선거리 참고이며 실제 도로 경로·이동시간·영업시간·체험 가능 여부는 확인되지 않았습니다.",
         })
         itinerary.append((day, activities))
     return itinerary
@@ -1577,7 +1599,15 @@ with st.container():
     with row2_transport:
         transport = st.selectbox("이동 수단", TRANSPORT_MODES)
     with row2_style:
-        travel_style = st.selectbox("여행 스타일", TRAVEL_STYLES)
+        travel_style_primary = st.selectbox("주요 여행 스타일", STYLE_NAMES, key="trip_style_primary_v614")
+        travel_style_secondary = st.selectbox(
+            "보조 여행 스타일 (선택)",
+            ("선택 안 함",) + tuple(s for s in STYLE_NAMES if s != travel_style_primary),
+            key="trip_style_secondary_v614",
+            help="선택하지 않으면 기존 단일 스타일로 일정이 만들어집니다.",
+        )
+        travel_style = (travel_style_primary if travel_style_secondary == "선택 안 함"
+                        else travel_style_primary + " + " + travel_style_secondary)
     with row2_child:
         family_party = party in ("우리 가족 여행", "3대 가족 여행")
         child_count = st.number_input(
@@ -1848,10 +1878,12 @@ if search_result:
     location_itinerary = []
     if ranked_attractions:
         days = duration_to_days(selected_duration)
-        attractions_per_day = attractions_per_day_for(selected_party, selected_style, selected_child_group)
+        plan = combined_style_plan(selected_style, selected_party, selected_child_group)
+        attractions_per_day = plan["attractions"]
         # 전체 거리순 재정렬은 동행 유형별 추천 순위를 무너뜨릴 수 있습니다.
         # 우선순위에 따라 장소를 선택하고, 하루 단위에서만 가까운 순서를 참고합니다.
-        course_attractions = ranked_attractions[: days * attractions_per_day]
+        style_ranked_attractions = prioritize_experiences(ranked_attractions) if plan["experience"] else ranked_attractions
+        course_attractions = style_ranked_attractions[: days * attractions_per_day]
         # 주변 장소 조회 후 그룹 단위로 가까운 관광지를 묶습니다.
         # 이 단계에서는 동행 유형별 추천 점수 순서를 유지합니다.
         # 검색 버전별로 원본 일정을 한 번만 생성합니다.
@@ -1863,7 +1895,7 @@ if search_result:
                 get_kakao_api_key(),
                 st.session_state.destination_location,
                 selected_transport,
-                selected_style,
+                style_components(selected_style)[0],
             )
             original_itinerary = build_location_itinerary(
                 nearby_response.get("groups", []),
@@ -1885,7 +1917,8 @@ if search_result:
         st.subheader("나만의 여행 일정")
         st.caption(
             f"맞춤 일정 기준: {selected_party} / 하루 관광지 {attractions_per_day}곳 · "
-            "동행 유형별 관광지 선호를 먼저 적용하고 가까운 관광지끼리 날짜별로 묶습니다. "
+            f"선택한 스타일: {selected_style} · 목표 식사 {plan['foods']}곳 · 카페 {plan['cafes']}곳. "
+            "후보가 부족하면 목표보다 적게 배치하며, 가까운 관광지끼리 날짜별로 묶습니다. "
             "거리 표기는 직선거리 참고이며 실제 경로 또는 이동시간이 아닙니다. "
             "실제 영업 여부는 확인하지 않았습니다."
         )
