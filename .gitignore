@@ -1,0 +1,9 @@
+# API credentials / local configuration
+.streamlit/secrets.toml
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
