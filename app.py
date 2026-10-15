@@ -324,6 +324,72 @@ def _closest_unused(candidates: list[dict], anchor: dict, used: set[str]) -> dic
     return selected
 
 
+# 지역별 대표 음식 키워드. 실제 메뉴 제공 여부는 검색 결과만으로 확인할 수 없습니다.
+REGIONAL_FOOD_KEYWORDS = {
+    "제주": ("흑돼지", "고기국수", "갈치", "옥돔", "전복", "몸국", "돔베", "보말", "해물뚝배기", "성게", "오메기"),
+    "속초": ("물회", "오징어순대", "아바이순대", "닭강정", "생선구이", "대게", "홍게", "회", "섭국"),
+    "강릉": ("초당순두부", "순두부", "장칼국수", "막국수", "감자옹심이", "물회", "회"),
+    "부산": ("돼지국밥", "밀면", "어묵", "낙곱새", "씨앗호떡", "복국", "회"),
+    "전주": ("비빔밥", "콩나물국밥", "한정식", "피순대", "순대국"),
+    "경주": ("쌈밥", "한우", "떡갈비", "순두부", "교리김밥"),
+    "여수": ("게장", "서대회", "갓김치", "장어탕", "돌게", "하모"),
+    "통영": ("충무김밥", "굴", "멍게", "도다리", "물회", "해물"),
+    "목포": ("세발낙지", "홍어", "민어", "꽃게", "갈치"),
+    "춘천": ("닭갈비", "막국수"),
+    "안동": ("찜닭", "간고등어", "헛제삿밥"),
+    "대구": ("막창", "뭉티기", "따로국밥", "납작만두", "동인동찜갈비"),
+    "대전": ("칼국수", "두부두루치기", "성심당"),
+    "인천": ("짜장면", "쫄면", "밴댕이", "물텀벙"),
+    "포항": ("과메기", "물회", "대게"),
+    "울릉": ("오징어", "따개비", "명이나물", "약소"),
+    "담양": ("떡갈비", "대통밥", "죽순"),
+    "보성": ("꼬막", "녹차", "벌교"),
+    "순천": ("꼬막", "짱뚱어", "국밥"),
+    "남원": ("추어탕"),
+    "군산": ("짬뽕", "꽃게", "박대", "아귀"),
+}
+CAFE_MOOD_KEYWORDS = (
+    "감성", "뷰", "오션뷰", "바다뷰", "숲뷰", "한옥", "정원", "루프탑", "테라스",
+    "로스터리", "스페셜티", "브런치", "베이커리", "디저트", "빈티지", "갤러리",
+    "북카페", "통창", "노을", "풍경", "가든", "독채", "힐링", "포토", "핸드드립",
+)
+
+
+def _local_food_keywords(destination: str) -> tuple[str, ...]:
+    for region, keywords in REGIONAL_FOOD_KEYWORDS.items():
+        if region in destination:
+            return keywords
+    return ()
+
+
+def _select_thematic_nearby(
+    candidates: list[dict], anchor: dict, used: set[str], kind: str, destination: str
+) -> tuple[dict | None, bool]:
+    """Prefer region-specific dishes or atmospheric cafes, while penalizing distant candidates.
+
+    Keyword matching is heuristic: no review, menu, operating hours, or quality verification.
+    """
+    available = [p for p in candidates if str(p.get("name", "")) + "|" + str(p.get("address", "")) not in used]
+    if not available:
+        return None, False
+    keywords = _local_food_keywords(destination) if kind == "food" else CAFE_MOOD_KEYWORDS
+
+    def evaluate(item):
+        index, place = item
+        text = " ".join(str(place.get(k) or "") for k in ("name", "category", "description"))
+        matched = sum(1 for word in keywords if word in text)
+        distance = _place_distance(anchor, place)
+        # 3 km ≈ 20 points, 10 km ≈ 67 points: avoid extreme detours for thematic places.
+        distance_penalty = min(distance / 150.0, 100.0) if distance != float("inf") else 60.0
+        return (matched * 85.0 - distance_penalty, -index)
+
+    selected = max(enumerate(available), key=evaluate)[1]
+    text = " ".join(str(selected.get(k) or "") for k in ("name", "category", "description"))
+    matched = any(word in text for word in keywords)
+    used.add(str(selected.get("name", "")) + "|" + str(selected.get("address", "")))
+    return selected, matched
+
+
 def _cluster_attraction_groups(groups: list[dict], count_per_day: int) -> list[dict]:
     """Keep the highest-ranked attraction as each day's anchor, then prefer nearby attractions."""
     remaining = list(groups)
@@ -344,7 +410,7 @@ def _cluster_attraction_groups(groups: list[dict], count_per_day: int) -> list[d
 
 def build_location_itinerary(
     groups: list[dict], duration: str, travel_style: str, transport: str,
-    party: str = "혼자 여행", child_group: str | None = None
+    party: str = "혼자 여행", child_group: str | None = None, destination: str = ""
 ) -> list[tuple[int, list[dict[str, str]]]]:
     days = duration_to_days(duration)
     attractions_per_day = attractions_per_day_for(party, travel_style, child_group)
@@ -389,9 +455,9 @@ def build_location_itinerary(
                 "한국관광공사 관광지 검색 결과입니다.",
             )
             first_restaurants = [place for group in day_groups for place in group.get("restaurants", [])]
-            lunch = _closest_unused(first_restaurants, first_group["attraction"], used_food)
+            lunch, lunch_matched = _select_thematic_nearby(first_restaurants, first_group["attraction"], used_food, "food", destination)
             if lunch:
-                add_activity("점심 식사", lunch, "첫 관광지에서 직선거리상 가까운 음식점 후보입니다. 영업시간·식사 가능 여부는 확인이 필요합니다.")
+                add_activity("점심 식사", lunch, "지역 대표 음식 키워드가 장소 정보에서 확인된 후보입니다. 메뉴·맛·영업시간은 별도 확인이 필요합니다." if lunch_matched else "지역 대표 음식 후보를 찾지 못해 이동 동선상 가까운 음식점을 배치했습니다. 메뉴·영업시간은 확인이 필요합니다.")
             elif first_group.get("attraction"):
                 activities.append({
                     "type": "식사",
@@ -411,11 +477,11 @@ def build_location_itinerary(
 
             cafes = [place for group in day_groups for place in group.get("cafes", [])]
             last_attraction = day_groups[-1]["attraction"]
-            cafe = _closest_unused(cafes, last_attraction, used_cafes)
+            cafe, cafe_matched = _select_thematic_nearby(cafes, last_attraction, used_cafes, "cafe", destination)
             if cafe:
-                add_activity("카페·휴식", cafe, "마지막 관광지에서 직선거리상 가까운 휴식 장소 후보입니다. 영업시간은 확인되지 않았습니다.")
+                add_activity("카페·휴식", cafe, "감성·전망·디저트 관련 키워드가 장소 정보에서 확인된 카페 후보입니다. 실제 분위기·영업시간은 확인이 필요합니다." if cafe_matched else "감성 키워드 후보가 없어 이동 동선상 가까운 카페를 배치했습니다. 실제 분위기·영업시간은 확인이 필요합니다.")
                 if travel_style == "휴식 중심":
-                    extra_cafe = _closest_unused(cafes, cafe, used_cafes)
+                    extra_cafe, _ = _select_thematic_nearby(cafes, cafe, used_cafes, "cafe", destination)
                     if extra_cafe:
                         add_activity("카페·휴식", extra_cafe, "첫 카페와 가까운 추가 휴식 장소 후보입니다.")
             else:
@@ -429,9 +495,9 @@ def build_location_itinerary(
 
             if travel_style == "맛집 중심":
                 dinner_anchor = cafe or last_attraction
-                dinner = _closest_unused(first_restaurants, dinner_anchor, used_food)
+                dinner, dinner_matched = _select_thematic_nearby(first_restaurants, dinner_anchor, used_food, "food", destination)
                 if dinner:
-                    add_activity("저녁 식사", dinner, "마지막 방문 장소에서 직선거리상 가까운 음식점 후보입니다. 저녁 영업 여부는 확인이 필요합니다.")
+                    add_activity("저녁 식사", dinner, "지역 대표 음식 키워드가 확인된 저녁 식사 후보입니다. 메뉴·저녁 영업 여부는 확인이 필요합니다." if dinner_matched else "이동 동선상 가까운 저녁 식사 후보입니다. 메뉴·영업시간은 확인이 필요합니다.")
 
         if not day_groups:
             activities.append({
@@ -1725,6 +1791,7 @@ if search_result:
                 selected_transport,
                 selected_party,
                 selected_child_group,
+                query,
             )
             st.session_state.trip_original_itinerary = deepcopy(original_itinerary)
             st.session_state.trip_editable_itinerary = deepcopy(original_itinerary)
