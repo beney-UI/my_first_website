@@ -1303,21 +1303,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# 검색 조건은 한눈에 읽히는 2열 배치로 통일합니다.
-# 여행 기간은 1~30일 직접 입력 기능을 그대로 유지합니다.
+# PC에서는 3열 × 2행 균등 배열, 모바일에서는 한 열로 표시합니다.
+# Streamlit 폼은 제출 전 선택 변경을 반영하지 않으므로 자녀 연령을 항상 표시하되
+# 가족 여행 유형일 때만 일정 추천에 적용합니다.
 with st.form("destination_search"):
-    destination_column, companion_column = st.columns(2, gap="medium")
-    with destination_column:
+    row1_destination, row1_party, row1_days = st.columns(3, gap="medium")
+    with row1_destination:
         destination_query = st.text_input(
             "여행지",
             placeholder="예: 서울, 경기 용인시, 제주 애월읍, 불국사",
             help="지역명이나 관광지명을 입력하면 TourAPI와 카카오 로컬 API에서 검색합니다.",
         )
-    with companion_column:
+    with row1_party:
         party = st.selectbox("누구와 여행하나요?", TRAVEL_PARTIES)
-
-    duration_column, transport_column = st.columns(2, gap="medium")
-    with duration_column:
+    with row1_days:
         travel_days = st.number_input(
             "여행 일수 (직접 선택)",
             min_value=1,
@@ -1327,24 +1326,22 @@ with st.form("destination_search"):
             help="1~30일 중 선택하세요. 1일은 당일치기, 5일은 4박 5일로 표시됩니다.",
         )
         duration = days_to_duration(int(travel_days))
-    with transport_column:
+
+    row2_transport, row2_style, row2_child = st.columns(3, gap="medium")
+    with row2_transport:
         transport = st.selectbox("이동 수단", TRANSPORT_MODES)
-
-    # 기간 안내는 별도 행에 배치하여 두 입력창의 높이를 맞춥니다.
-    st.caption(f"선택한 여행 기간: {duration}")
-    travel_style = st.selectbox("여행 스타일", TRAVEL_STYLES)
-
-    child_group = None
-    child_age = None
-    # Streamlit 폼은 제출 전까지 다른 위젯 값의 변경을 Python에 전달하지 않습니다.
-    # 따라서 동행자 선택에 따라 즉시 숨기는 대신, 접을 수 있는 선택 항목에 보관합니다.
-    with st.expander("자녀 동반 · 후기 및 영상 상세 옵션", expanded=False):
+    with row2_style:
+        travel_style = st.selectbox("여행 스타일", TRAVEL_STYLES)
+    with row2_child:
         child_choice = st.selectbox(
-            "자녀 연령 (가족 여행일 때 적용)", FAMILY_CHILD_OPTIONS,
+            "자녀 연령 (가족 여행만 적용)", FAMILY_CHILD_OPTIONS,
             index=0,
             key="trip_child_group_v58",
             help="우리 가족 여행 또는 3대 가족 여행을 선택한 경우에만 일정 추천에 반영됩니다.",
         )
+
+    st.caption(f"선택한 여행 기간: {duration}")
+    with st.expander("후기 · 영상 상세 옵션", expanded=False):
         advanced_left, advanced_right = st.columns(2, gap="medium")
         with advanced_left:
             content_period = st.selectbox("후기·영상 기간", PERIOD_OPTIONS, index=1)
@@ -1353,9 +1350,7 @@ with st.form("destination_search"):
 
     child_group = child_choice if party in ("우리 가족 여행", "3대 가족 여행") else None
     companion = companion_for_media(party, child_group)
-    if child_group and child_group != "아이 없음":
-        child_age = child_group
-
+    child_age = child_group if child_group and child_group != "아이 없음" else None
     submitted = st.form_submit_button("여행지 검색", type="primary", use_container_width=True)
 
 if "search_result" not in st.session_state:
