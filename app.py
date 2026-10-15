@@ -310,6 +310,38 @@ def _valid_map_coordinates(place: Place) -> tuple[float, float] | None:
     return latitude, longitude
 
 
+def _place_distance(a: dict, b: dict) -> float:
+    distance = _straight_distance_meters(a.get("x"), a.get("y"), b.get("x"), b.get("y"))
+    return distance if distance is not None else float("inf")
+
+
+def _closest_unused(candidates: list[dict], anchor: dict, used: set[str]) -> dict | None:
+    available = [p for p in candidates if str(p.get("name", "")) + "|" + str(p.get("address", "")) not in used]
+    if not available:
+        return None
+    selected = min(enumerate(available), key=lambda pair: (_place_distance(anchor, pair[1]), pair[0]))[1]
+    used.add(str(selected.get("name", "")) + "|" + str(selected.get("address", "")))
+    return selected
+
+
+def _cluster_attraction_groups(groups: list[dict], count_per_day: int) -> list[dict]:
+    """Keep the highest-ranked attraction as each day's anchor, then prefer nearby attractions."""
+    remaining = list(groups)
+    ordered = []
+    while remaining:
+        anchor = remaining.pop(0)
+        ordered.append(anchor)
+        current = anchor["attraction"]
+        for _ in range(max(0, count_per_day - 1)):
+            if not remaining:
+                break
+            index = min(range(len(remaining)), key=lambda i: (_place_distance(current, remaining[i]["attraction"]), i))
+            nearest = remaining.pop(index)
+            ordered.append(nearest)
+            current = nearest["attraction"]
+    return ordered
+
+
 def build_location_itinerary(
     groups: list[dict], duration: str, travel_style: str, transport: str,
     party: str = "혼자 여행", child_group: str | None = None
@@ -318,6 +350,9 @@ def build_location_itinerary(
     attractions_per_day = attractions_per_day_for(party, travel_style, child_group)
     itinerary = []
     group_index = 0
+    groups = _cluster_attraction_groups(groups, attractions_per_day)
+    used_food: set[str] = set()
+    used_cafes: set[str] = set()
 
     for day in range(1, days + 1):
         day_groups = groups[group_index : group_index + attractions_per_day]
@@ -353,9 +388,10 @@ def build_location_itinerary(
                 first_group["attraction"],
                 "한국관광공사 관광지 검색 결과입니다.",
             )
-            first_restaurants = first_group.get("restaurants", [])
-            if first_restaurants:
-                add_activity("점심 식사", first_restaurants[0], "관광지 주변 카카오 음식점 검색 결과입니다.")
+            first_restaurants = [place for group in day_groups for place in group.get("restaurants", [])]
+            lunch = _closest_unused(first_restaurants, first_group["attraction"], used_food)
+            if lunch:
+                add_activity("점심 식사", lunch, "첫 관광지에서 직선거리상 가까운 음식점 후보입니다. 영업시간·식사 가능 여부는 확인이 필요합니다.")
             elif first_group.get("attraction"):
                 activities.append({
                     "type": "식사",
@@ -374,10 +410,14 @@ def build_location_itinerary(
                 )
 
             cafes = [place for group in day_groups for place in group.get("cafes", [])]
-            if cafes:
-                add_activity("카페·휴식", cafes[0], "관광지 주변 카카오 카페 검색 결과입니다.")
-                if travel_style == "휴식 중심" and len(cafes) > 1:
-                    add_activity("카페·휴식", cafes[1], "휴식 중심 일정의 주변 카페 검색 결과입니다.")
+            last_attraction = day_groups[-1]["attraction"]
+            cafe = _closest_unused(cafes, last_attraction, used_cafes)
+            if cafe:
+                add_activity("카페·휴식", cafe, "마지막 관광지에서 직선거리상 가까운 휴식 장소 후보입니다. 영업시간은 확인되지 않았습니다.")
+                if travel_style == "휴식 중심":
+                    extra_cafe = _closest_unused(cafes, cafe, used_cafes)
+                    if extra_cafe:
+                        add_activity("카페·휴식", extra_cafe, "첫 카페와 가까운 추가 휴식 장소 후보입니다.")
             else:
                 activities.append({
                     "type": "카페·휴식",
@@ -387,8 +427,11 @@ def build_location_itinerary(
                     "url": "",
                 })
 
-            if travel_style == "맛집 중심" and len(first_restaurants) > 1:
-                add_activity("저녁 식사", first_restaurants[1], "주변 음식점 추가 검색 결과입니다.")
+            if travel_style == "맛집 중심":
+                dinner_anchor = cafe or last_attraction
+                dinner = _closest_unused(first_restaurants, dinner_anchor, used_food)
+                if dinner:
+                    add_activity("저녁 식사", dinner, "마지막 방문 장소에서 직선거리상 가까운 음식점 후보입니다. 저녁 영업 여부는 확인이 필요합니다.")
 
         if not day_groups:
             activities.append({
@@ -403,7 +446,7 @@ def build_location_itinerary(
             "type": "이동 참고",
             "name": transport,
             "address": "",
-            "reason": "장소 순서는 좌표가 있을 때 직선거리만 참고합니다. 도로·대중교통 경로 및 소요시간은 제공하지 않습니다.",
+            "reason": "동행자별 추천 우선순위를 유지하면서 같은 날짜의 가까운 관광지를 묶고, 관광지 주변 식사·휴식 장소를 배치했습니다. 직선거리 기반 추정으로 실제 도로·대중교통 경로, 소요시간, 영업시간은 확인되지 않았습니다.",
             "url": "",
         })
         itinerary.append((day, activities))
@@ -1662,13 +1705,8 @@ if search_result:
         # 전체 거리순 재정렬은 동행 유형별 추천 순위를 무너뜨릴 수 있습니다.
         # 우선순위에 따라 장소를 선택하고, 하루 단위에서만 가까운 순서를 참고합니다.
         course_attractions = ranked_attractions[: days * attractions_per_day]
-        course_attractions = [
-            place
-            for start in range(0, len(course_attractions), attractions_per_day)
-            for place in order_attractions_by_distance(
-                course_attractions[start:start + attractions_per_day]
-            )
-        ]
+        # 주변 장소 조회 후 그룹 단위로 가까운 관광지를 묶습니다.
+        # 이 단계에서는 동행 유형별 추천 점수 순서를 유지합니다.
         # 검색 버전별로 원본 일정을 한 번만 생성합니다.
         # 편집 버튼으로 Streamlit이 재실행되어도 API를 반복 호출하지 않습니다.
         itinerary_key = st.session_state.get("trip_search_version", 0)
@@ -1699,7 +1737,7 @@ if search_result:
         st.subheader("나만의 여행 일정")
         st.caption(
             f"맞춤 일정 기준: {selected_party} / 하루 관광지 {attractions_per_day}곳 · "
-            "동행 유형별 관광지 선호를 먼저 적용한 뒤 하루 내 이동 순서를 정합니다. "
+            "동행 유형별 관광지 선호를 먼저 적용하고 가까운 관광지끼리 날짜별로 묶습니다. "
             "거리 표기는 직선거리 참고이며 실제 경로 또는 이동시간이 아닙니다. "
             "실제 영업 여부는 확인하지 않았습니다."
         )
