@@ -420,17 +420,20 @@ def is_editable_visit(activity: dict) -> bool:
     )
 
 
+KAKAO_EDIT_CATEGORY_CODES = {"관광지": "AT4", "음식점": "FD6", "카페": "CE7"}
+KAKAO_EDIT_CATEGORY_WORDS = {"관광지": "관광명소", "음식점": "음식점", "카페": "카페"}
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def search_kakao_edit_places(keyword: str, api_key: str, longitude: str, latitude: str) -> tuple[list[dict], str]:
-    """카카오 로컬 키워드 검색: 앱의 기존 API 키를 사용하고 검색 결과를 10분 캐시합니다."""
+def search_kakao_edit_places(keyword: str, api_key: str, category: str) -> tuple[list[dict], str]:
+    """지역명+장소 종류로 검색하고 카카오 공식 분류 코드로 엄격하게 필터링합니다."""
     if not api_key:
         return [], "카카오 REST API 키가 설정되지 않았습니다."
-    params = {"query": keyword, "size": 15, "sort": "accuracy"}
-    try:
-        if longitude and latitude and -180 <= float(longitude) <= 180 and -90 <= float(latitude) <= 90:
-            params.update({"x": longitude, "y": latitude, "radius": 20000})
-    except (ValueError, TypeError):
-        pass
+    category_code = KAKAO_EDIT_CATEGORY_CODES.get(category)
+    if not category_code:
+        return [], "지원하지 않는 장소 종류입니다."
+    query = f"{keyword.strip()} {KAKAO_EDIT_CATEGORY_WORDS[category]}".strip()
+    params = {"query": query, "size": 15, "page": 1, "sort": "accuracy", "category_group_code": category_code}
     request = Request(
         "https://dapi.kakao.com/v2/local/search/keyword.json?" + urlencode(params),
         headers={"Authorization": f"KakaoAK {api_key}"},
@@ -442,46 +445,51 @@ def search_kakao_edit_places(keyword: str, api_key: str, longitude: str, latitud
         return [], f"카카오 검색 실패 (HTTP {exc.code}). API 설정을 확인하세요."
     except (URLError, TimeoutError, ValueError, OSError):
         return [], "카카오 검색 연결에 실패했습니다. 잠시 후 다시 시도해 주세요."
-    return payload.get("documents", []), ""
+    places = [place for place in payload.get("documents", [])
+              if place.get("category_group_code") == category_code]
+    return places, ""
 
 
 def render_place_search_editor(itinerary: list, destination: str) -> None:
     """카카오 장소 검색 결과를 기존 일정에 추가하거나 기존 장소와 교체합니다."""
     st.markdown("#### 장소 검색 · 추가 · 교체")
-    st.caption("카카오 로컬 API의 실제 검색 결과를 사용합니다. 추가·교체한 장소는 나만의 여행 일정·지도·후기·영상에 함께 반영됩니다.")
+    st.caption("관광지·음식점·카페 중 선택한 종류만 카카오 공식 분류 기준으로 검색합니다. 예: 음식점 선택 후 제주도 입력. 결과는 일정·지도·후기·영상에 반영됩니다.")
     if not itinerary:
         return
     with st.form("trip_place_search_form"):
         category = st.selectbox("장소 종류", ["관광지", "음식점", "카페"], key="trip_edit_category")
-        keyword = st.text_input("검색할 장소", placeholder="예: 영금정, 속초 중앙시장, 바다 전망 카페", key="trip_edit_keyword")
+        keyword = st.text_input(
+            "검색할 지역 또는 장소", placeholder="예: 제주도, 서귀포, 속초, 영금정",
+            key="trip_edit_keyword",
+        )
         search_clicked = st.form_submit_button("장소 검색", type="primary")
     if search_clicked:
         if not keyword.strip():
-            st.warning("검색할 장소 이름을 입력해 주세요.")
+            st.warning("검색할 지역 또는 장소를 입력해 주세요.")
             st.session_state.trip_edit_search_results = []
+            st.session_state.trip_edit_search_error = ""
         else:
-            # 기존 일정의 첫 좌표를 중심으로 검색해 다른 지역의 동명 장소를 줄입니다.
-            coord = next(
-                (a for _, activities in itinerary for a in activities
-                 if a.get("latitude") and a.get("longitude")), None
-            )
-            lon = coord.get("longitude", "") if coord else ""
-            lat = coord.get("latitude", "") if coord else ""
-            category_word = {"관광지": "관광명소", "음식점": "음식점", "카페": "카페"}[category]
-            query = f"{destination} {keyword.strip()}".strip()
-            if keyword.strip() in ("추천", "주변", "가까운", "맛집"):
-                query = f"{destination} {category_word}"
-            with st.spinner("카카오에서 장소를 검색하고 있습니다..."):
-                places, error = search_kakao_edit_places(query, get_kakao_api_key(), lon, lat)
+            # 현재 일정 좌표를 반경 기준으로 강제하지 않습니다.
+            # 제주도를 검색하면 기존 여행지가 어디든 제주도 결과를 받을 수 있습니다.
+            with st.spinner("선택한 장소 종류만 검색하고 있습니다..."):
+                places, error = search_kakao_edit_places(
+                    keyword.strip(), get_kakao_api_key(), category
+                )
             st.session_state.trip_edit_search_results = places
             st.session_state.trip_edit_search_category = category
+            st.session_state.trip_edit_search_keyword = keyword.strip()
             st.session_state.trip_edit_search_error = error
     if st.session_state.get("trip_edit_search_error"):
         st.warning(st.session_state.trip_edit_search_error)
     places = st.session_state.get("trip_edit_search_results", [])
     if not places:
+        if st.session_state.get("trip_edit_search_keyword") and not st.session_state.get("trip_edit_search_error"):
+            st.info("선택한 종류에 해당하는 검색 결과가 없습니다. 지역명이나 장소명을 바꿔 다시 검색해 주세요.")
         return
-    st.caption(f"검색 결과 {len(places)}곳 · 실제 방문 가능 여부와 영업시간은 별도 확인 필요")
+    st.caption(
+        f"{st.session_state.get('trip_edit_search_category', '관광지')}만 표시 · "
+        f"검색 결과 {len(places)}곳 · 영업시간 및 실제 위치는 선택 전 확인해 주세요."
+    )
     choices = list(range(len(places)))
     choice = st.selectbox(
         "추가하거나 교체할 장소 선택", choices,
@@ -520,8 +528,7 @@ def render_place_search_editor(itinerary: list, destination: str) -> None:
             st.error("이 장소는 지도 좌표가 없어 일정에 추가할 수 없습니다.")
             return
         if action == "기존 장소 교체" and replace_index is not None:
-            # 식사/카페 등의 기존 시간대 라벨을 보존합니다.
-            new_activity["type"] = activities[replace_index].get("type", kind)
+            # 교체된 장소의 실제 분류를 유지합니다. 관광지→카페 교체도 정확히 반영합니다.
             activities[replace_index] = new_activity
         else:
             # 이동 참고 문구 앞에 추가합니다.
