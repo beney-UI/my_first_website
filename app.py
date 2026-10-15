@@ -574,9 +574,10 @@ def _itinerary_quality_notes(itinerary: list, transport: str = "자차") -> list
         visits = [a for a in activities if a.get("type") in EDITABLE_PLACE_TYPES and a.get("name") != "주변 장소 검색 결과 없음"]
         for activity in visits:
             identity = _place_identity(activity)
-            if identity in seen:
+            if identity and identity in seen:
                 notes.append(f"{day}일 차: 다른 날짜와 중복된 방문 장소가 있습니다 ({activity.get('name', '')}).")
-            seen.add(identity)
+            if identity:
+                seen.add(identity)
         for before, after in zip(visits, visits[1:]):
             dist = _straight_distance_meters(before.get("longitude"), before.get("latitude"), after.get("longitude"), after.get("latitude"))
             if dist is not None and dist > warning_radius:
@@ -855,6 +856,8 @@ def _auto_adjust_day(activities: list, transport: str, start: int, end: int, pac
             _, test_finish, _ = _schedule_for_day(test, transport, start, pace, start_anchor, end_anchor)
             if best is None or test_finish < best[0]:
                 best = (test_finish, i, a)
+        if best is None or best[0] >= finish:
+            break
         _, index, activity = best
         removed.append(activity)
         candidate.pop(index)
@@ -874,6 +877,9 @@ def render_auto_adjustment(itinerary: list, transport: str, lodging: dict | None
             first, last = i == 0, i == len(itinerary) - 1
             day_start = arrival if first else start_hour
             day_end = departure if last else end_hour
+            if first and last and day_start >= day_end:
+                st.warning("당일치기: 도착 예정 시각이 귀가 출발 시각보다 빠르도록 설정해 주세요.")
+                continue
             from_lodging = lodging if lodging and not first else None
             to_lodging = lodging if lodging and not last else None
             _, before_finish, _ = _schedule_for_day(activities, transport, day_start, pace, from_lodging, to_lodging)
@@ -905,9 +911,57 @@ def render_auto_adjustment(itinerary: list, transport: str, lodging: dict | None
             st.rerun()
 
 
+def render_integrity_audit(itinerary: list, transport: str) -> None:
+    """Read-only consistency audit for the current editable itinerary."""
+    with st.expander("6-20 · 통합 안정성 점검", expanded=False):
+        if not itinerary:
+            st.info("점검할 여행 일정이 없습니다.")
+            return
+        warnings = []
+        day_ids = []
+        identities = set()
+        total = 0
+        for day, activities in itinerary:
+            day_ids.append(day)
+            if not isinstance(activities, list):
+                warnings.append(f"{day}일 차: 일정 데이터 형식이 올바르지 않습니다.")
+                continue
+            visits = [a for a in activities if isinstance(a, dict) and a.get("type") in EDITABLE_PLACE_TYPES]
+            total += len(visits)
+            for a in visits:
+                name = str(a.get("name") or "").strip()
+                if not name:
+                    warnings.append(f"{day}일 차: 이름이 없는 장소가 있습니다.")
+                identity = _place_identity(a)
+                if identity and identity in identities:
+                    warnings.append(f"{day}일 차: 중복 장소 '{name}'")
+                if identity:
+                    identities.add(identity)
+                lon, lat = a.get("longitude"), a.get("latitude")
+                if lon or lat:
+                    if _straight_distance_meters(lon, lat, lon, lat) is None:
+                        warnings.append(f"{day}일 차: '{name}' 좌표를 확인할 수 없습니다.")
+            if not any(a.get("type") in ("식사", "점심 식사", "저녁 식사") for a in visits):
+                warnings.append(f"{day}일 차: 식사 장소가 없습니다.")
+        if len(day_ids) != len(set(day_ids)):
+            warnings.append("날짜 번호가 중복되어 있습니다.")
+        st.caption(f"검사 날짜 {len(day_ids)}일 · 방문 장소 {total}곳 · 현재 일정 기준")
+        warnings.extend(_itinerary_quality_notes(itinerary, transport))
+        warnings = list(dict.fromkeys(warnings))
+        if warnings:
+            st.warning(f"점검 항목 {len(warnings)}건이 발견되었습니다. 아래 내용을 확인해 주세요.")
+            for message in warnings[:30]:
+                st.write("• " + message)
+            if len(warnings) > 30:
+                st.caption(f"추가 {len(warnings)-30}건은 표시하지 않았습니다.")
+        else:
+            st.success("중복·누락·이동거리 기준의 점검 항목이 없습니다.")
+        st.caption("이 점검은 일정 데이터를 변경하지 않습니다. 지도 표시·API 응답·실제 교통시간·영업 여부를 검증하는 것은 아닙니다.")
+
+
 def render_time_schedule(itinerary: list, transport: str, destination: str = "") -> None:
     st.markdown("#### 예상 시간표 · 일정 현실성 점검")
-    st.caption("6-19: 첫날 도착·마지막 날 출발·숙소 이동을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
+    st.caption("6-20: 첫날 도착·마지막 날 출발·숙소 이동을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
     a, b, c = st.columns(3)
     with a:
         start_hour = st.selectbox("중간 날짜 출발 시각", list(range(7, 13)), index=2,
@@ -953,6 +1007,9 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
         is_last = day == final_day
         day_start = arrival if is_first else start_hour
         day_end = departure if is_last else end_hour
+        if is_first and is_last and day_start >= day_end:
+            st.warning("당일치기: 첫날 도착 예정 시각보다 마지막 날 귀가 출발 시각을 늦게 설정해 주세요.")
+            continue
         # 숙소를 선택했다면 첫날 관광 후 숙소까지, 중간 날은 숙소 왕복,
         # 마지막 날은 숙소에서 첫 관광지까지의 이동을 포함합니다.
         from_lodging = lodging if lodging and not is_first else None
@@ -983,6 +1040,7 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
                 st.caption("귀가 출발시각은 여행지에서 귀가를 시작하는 시각입니다. 공항·역 이동 및 수속시간은 별도로 고려하세요.")
             st.caption("일정 편집 시 자동 재계산됩니다. 도로·버스 경로, 실시간 교통, 영업시간, 숙소 체크인 가능시간은 미확인입니다.")
     render_auto_adjustment(itinerary, transport, lodging, start_hour, end_hour, arrival, departure, pace)
+    render_integrity_audit(itinerary, transport)
     st.info("숙소는 이동시간 추정에 반영됩니다. 자동 조정은 미리보기 후 적용 버튼을 눌러야 실제 일정에 반영됩니다.")
 
 
@@ -1156,11 +1214,15 @@ def render_editable_itinerary(itinerary: list[tuple[int, list[dict[str, str]]]])
                 if up:
                     previous = editable_indices[visit_number - 2]
                     activities[previous], activities[index] = activities[index], activities[previous]
+                    activities[previous]["manual_edit"] = True
+                    activities[index]["manual_edit"] = True
                     st.session_state.trip_editable_itinerary = deepcopy(itinerary)
                     st.rerun()
                 if down:
                     following = editable_indices[visit_number]
                     activities[following], activities[index] = activities[index], activities[following]
+                    activities[following]["manual_edit"] = True
+                    activities[index]["manual_edit"] = True
                     st.session_state.trip_editable_itinerary = deepcopy(itinerary)
                     st.rerun()
                 if delete:
@@ -1345,11 +1407,15 @@ def render_imported_trip() -> None:
                 if c1.button("↑ 위로", key=f"imp_up_{day_index}_{index}", disabled=number == 1, use_container_width=True):
                     previous = indices[number - 2]
                     activities[previous], activities[index] = activities[index], activities[previous]
+                    activities[previous]["manual_edit"] = True
+                    activities[index]["manual_edit"] = True
                     st.session_state.trip_editable_itinerary = deepcopy(itinerary)
                     st.rerun()
                 if c2.button("↓ 아래로", key=f"imp_down_{day_index}_{index}", disabled=number == len(indices), use_container_width=True):
                     following = indices[number]
                     activities[following], activities[index] = activities[index], activities[following]
+                    activities[following]["manual_edit"] = True
+                    activities[index]["manual_edit"] = True
                     st.session_state.trip_editable_itinerary = deepcopy(itinerary)
                     st.rerun()
                 if c3.button("삭제", key=f"imp_delete_{day_index}_{index}", use_container_width=True):
