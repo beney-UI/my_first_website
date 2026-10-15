@@ -816,9 +816,98 @@ def _schedule_for_day(
     return rows, current, travel_total
 
 
+# 6-19: 변경안을 미리 계산하며, 사용자가 적용하기 전에는 실제 일정을 변경하지 않습니다.
+def _optimized_day_order(activities: list, transport: str, anchor: dict | None) -> list:
+    """식사/카페 슬롯은 유지하고 관광지 슬롯만 가까운 순서로 재배치합니다."""
+    result = deepcopy(activities)
+    slots = [i for i, a in enumerate(result) if a.get("type") == "관광" and not a.get("manual_edit")]
+    pool = [result[i] for i in slots]
+    if len(pool) < 2:
+        return result
+    previous = anchor
+    for slot in slots:
+        if previous is None:
+            # 첫 관광지는 원래 추천 우선순위를 유지
+            selected = pool.pop(0)
+        else:
+            selected = min(pool, key=lambda a: _estimated_transfer_minutes(previous, a, transport)[0])
+            pool.remove(selected)
+        result[slot] = selected
+        previous = selected
+    return result
+
+
+def _auto_adjust_day(activities: list, transport: str, start: int, end: int, pace: str,
+                     start_anchor: dict | None, end_anchor: dict | None) -> tuple[list, list, int, int]:
+    candidate = _optimized_day_order(activities, transport, start_anchor)
+    removed = []
+    _, finish, _ = _schedule_for_day(candidate, transport, start, pace, start_anchor, end_anchor)
+    # 식사와 사용자가 직접 추가/교체한 장소는 삭제하지 않습니다.
+    while finish > end * 60:
+        removable = [(i, a) for i, a in enumerate(candidate)
+                     if a.get("type") in ("관광", "카페·휴식") and not a.get("manual_edit")]
+        if not removable:
+            break
+        # 각 후보를 하나씩 제외해 종료시각이 가장 빨라지는 선택을 채택
+        best = None
+        for i, a in removable:
+            test = candidate[:i] + candidate[i + 1:]
+            _, test_finish, _ = _schedule_for_day(test, transport, start, pace, start_anchor, end_anchor)
+            if best is None or test_finish < best[0]:
+                best = (test_finish, i, a)
+        _, index, activity = best
+        removed.append(activity)
+        candidate.pop(index)
+        _, finish, _ = _schedule_for_day(candidate, transport, start, pace, start_anchor, end_anchor)
+    _, finish, travel = _schedule_for_day(candidate, transport, start, pace, start_anchor, end_anchor)
+    return candidate, removed, finish, travel
+
+
+def render_auto_adjustment(itinerary: list, transport: str, lodging: dict | None,
+                           start_hour: int, end_hour: int, arrival: int, departure: int,
+                           pace: str) -> None:
+    with st.expander("6-19 · 일정 자동 조정 미리보기", expanded=False):
+        st.caption("시간 초과 날짜를 대상으로 관광지 순서를 조정하고, 필요한 경우 자동 추천 관광지·카페를 제외합니다. 식사와 직접 추가·교체한 장소는 유지합니다.")
+        proposed = deepcopy(itinerary)
+        changes = []
+        for i, (day, activities) in enumerate(itinerary):
+            first, last = i == 0, i == len(itinerary) - 1
+            day_start = arrival if first else start_hour
+            day_end = departure if last else end_hour
+            from_lodging = lodging if lodging and not first else None
+            to_lodging = lodging if lodging and not last else None
+            _, before_finish, _ = _schedule_for_day(activities, transport, day_start, pace, from_lodging, to_lodging)
+            if before_finish <= day_end * 60:
+                continue
+            adjusted, removed, after_finish, _ = _auto_adjust_day(
+                activities, transport, day_start, day_end, pace, from_lodging, to_lodging
+            )
+            proposed[i] = (day, adjusted)
+            before_visits = [a.get("name") for a in activities if a.get("type") in EDITABLE_PLACE_TYPES]
+            after_visits = [a.get("name") for a in adjusted if a.get("type") in EDITABLE_PLACE_TYPES]
+            if before_visits != after_visits:
+                changes.append((day, before_finish, after_finish, removed, day_end, before_visits, after_visits))
+        if not changes:
+            st.success("시간 초과 일정이 없거나 안전하게 조정할 수 있는 변경 사항이 없습니다.")
+            return
+        for day, before, after, removed, limit, before_names, after_names in changes:
+            st.markdown(f"**{day}일 차: {_clock(before)} → {_clock(after)} (목표 {_clock(limit * 60)})**")
+            st.write("변경 전: " + " → ".join(before_names))
+            st.write("변경 후: " + (" → ".join(after_names) if after_names else "방문 장소 없음"))
+            if removed:
+                st.warning("일정에서 제외 예정: " + ", ".join(a.get("name", "") for a in removed))
+            if after > limit * 60:
+                st.warning("조정 후에도 종료시간을 초과합니다. 직접 추가한 장소 또는 식사 일정 조정이 필요합니다.")
+        st.caption("제외되는 장소는 다른 날짜로 자동 이동하지 않습니다. 실제 경로·운영시간은 검증되지 않습니다.")
+        if st.button("위 변경안 일정에 적용", type="primary", key="trip_619_apply"):
+            st.session_state.trip_editable_itinerary = deepcopy(proposed)
+            st.session_state.trip_edit_last_change = "6-19 일정 자동 조정 적용"
+            st.rerun()
+
+
 def render_time_schedule(itinerary: list, transport: str, destination: str = "") -> None:
     st.markdown("#### 예상 시간표 · 일정 현실성 점검")
-    st.caption("6-18: 첫날 도착·마지막 날 출발·숙소 이동을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
+    st.caption("6-19: 첫날 도착·마지막 날 출발·숙소 이동을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
     a, b, c = st.columns(3)
     with a:
         start_hour = st.selectbox("중간 날짜 출발 시각", list(range(7, 13)), index=2,
@@ -893,7 +982,8 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
             if is_last:
                 st.caption("귀가 출발시각은 여행지에서 귀가를 시작하는 시각입니다. 공항·역 이동 및 수속시간은 별도로 고려하세요.")
             st.caption("일정 편집 시 자동 재계산됩니다. 도로·버스 경로, 실시간 교통, 영업시간, 숙소 체크인 가능시간은 미확인입니다.")
-    st.info("숙소는 시간표의 출발·복귀 이동 추정에 반영됩니다. 관광지 추천 순서 자체는 변경하지 않습니다.")
+    render_auto_adjustment(itinerary, transport, lodging, start_hour, end_hour, arrival, departure, pace)
+    st.info("숙소는 이동시간 추정에 반영됩니다. 자동 조정은 미리보기 후 적용 버튼을 눌러야 실제 일정에 반영됩니다.")
 
 
 EDITABLE_PLACE_TYPES = {"관광", "식사", "점심 식사", "저녁 식사", "카페·휴식"}
@@ -1015,10 +1105,12 @@ def render_place_search_editor(itinerary: list, destination: str) -> None:
             return
         if action == "기존 장소 교체" and replace_index is not None:
             # 교체된 장소의 실제 분류를 유지합니다. 관광지→카페 교체도 정확히 반영합니다.
+            new_activity["manual_edit"] = True
             activities[replace_index] = new_activity
         else:
             # 이동 참고 문구 앞에 추가합니다.
             insert_at = next((i for i, a in enumerate(activities) if a.get("type") == "이동 참고"), len(activities))
+            new_activity["manual_edit"] = True
             activities.insert(insert_at, new_activity)
         # 편집 결과를 세션의 단일 원본에 명시적으로 저장합니다.
         # 지도와 일정표, 후기/영상이 모두 이 상태를 읽습니다.
