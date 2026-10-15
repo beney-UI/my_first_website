@@ -1184,8 +1184,8 @@ st.markdown(
     }
     .stApp { background: #f7faf9; color: var(--ink); }
     section.main > div.block-container {
-        max-width: 1120px;
-        padding-top: 2.4rem;
+        max-width: 1160px;
+        padding-top: 2rem;
         padding-bottom: 4rem;
     }
     h1, h2, h3 { color: var(--ink); }
@@ -1235,7 +1235,10 @@ st.markdown(
         color: #52666c !important;
         opacity: 1 !important;
     }
-    [data-testid="stForm"] [data-testid="stVerticalBlock"] { gap: 0.75rem; }
+    [data-testid="stForm"] [data-testid="stVerticalBlock"] { gap: 0.65rem; }
+    [data-testid="stForm"] [data-testid="stHorizontalBlock"] { align-items: start; }
+    [data-testid="stForm"] [data-testid="stColumn"] { min-width: 0; }
+    [data-testid="stForm"] [data-testid="stExpander"] { margin-top: 0.25rem; }
     [data-testid="stForm"] [data-testid="stFormSubmitButton"] button {
         min-height: 46px;
         margin-top: 0.35rem;
@@ -1300,8 +1303,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# 검색 조건은 한눈에 읽히는 2열 배치로 통일합니다.
+# 여행 기간은 1~30일 직접 입력 기능을 그대로 유지합니다.
 with st.form("destination_search"):
-    destination_column, companion_column = st.columns([1.35, 1])
+    destination_column, companion_column = st.columns(2, gap="medium")
     with destination_column:
         destination_query = st.text_input(
             "여행지",
@@ -1310,8 +1315,8 @@ with st.form("destination_search"):
         )
     with companion_column:
         party = st.selectbox("누구와 여행하나요?", TRAVEL_PARTIES)
-        companion = companion_for_media(party, None)
-    duration_column, transport_column, style_column = st.columns(3)
+
+    duration_column, transport_column = st.columns(2, gap="medium")
     with duration_column:
         travel_days = st.number_input(
             "여행 일수 (직접 선택)",
@@ -1319,29 +1324,38 @@ with st.form("destination_search"):
             max_value=MAX_TRAVEL_DAYS,
             value=2,
             step=1,
-            help="1~30일 중 선택하세요. 1일은 당일치기, 5일은 4박 5일로 자동 표시됩니다.",
+            help="1~30일 중 선택하세요. 1일은 당일치기, 5일은 4박 5일로 표시됩니다.",
         )
         duration = days_to_duration(int(travel_days))
-        st.caption(f"선택한 여행 기간: {duration}")
     with transport_column:
         transport = st.selectbox("이동 수단", TRANSPORT_MODES)
-    with style_column:
-        travel_style = st.selectbox("여행 스타일", TRAVEL_STYLES)
-    content_period = st.selectbox("후기·영상 기간", PERIOD_OPTIONS, index=1)
-    video_order = st.selectbox("YouTube 정렬", VIDEO_ORDER_OPTIONS)
+
+    # 기간 안내는 별도 행에 배치하여 두 입력창의 높이를 맞춥니다.
+    st.caption(f"선택한 여행 기간: {duration}")
+    travel_style = st.selectbox("여행 스타일", TRAVEL_STYLES)
+
     child_group = None
     child_age = None
-    # 조건부 위젯 생성/제거 대신 항상 같은 위젯 트리를 유지합니다.
-    child_choice = st.selectbox(
-        "자녀 연령 (가족 여행일 때 적용)", FAMILY_CHILD_OPTIONS,
-        index=0, disabled=party not in ("우리 가족 여행", "3대 가족 여행"),
-        key="trip_child_group_v58",
-    )
+    # Streamlit 폼은 제출 전까지 다른 위젯 값의 변경을 Python에 전달하지 않습니다.
+    # 따라서 동행자 선택에 따라 즉시 숨기는 대신, 접을 수 있는 선택 항목에 보관합니다.
+    with st.expander("자녀 동반 · 후기 및 영상 상세 옵션", expanded=False):
+        child_choice = st.selectbox(
+            "자녀 연령 (가족 여행일 때 적용)", FAMILY_CHILD_OPTIONS,
+            index=0,
+            key="trip_child_group_v58",
+            help="우리 가족 여행 또는 3대 가족 여행을 선택한 경우에만 일정 추천에 반영됩니다.",
+        )
+        advanced_left, advanced_right = st.columns(2, gap="medium")
+        with advanced_left:
+            content_period = st.selectbox("후기·영상 기간", PERIOD_OPTIONS, index=1)
+        with advanced_right:
+            video_order = st.selectbox("YouTube 정렬", VIDEO_ORDER_OPTIONS)
+
     child_group = child_choice if party in ("우리 가족 여행", "3대 가족 여행") else None
     companion = companion_for_media(party, child_group)
     if child_group and child_group != "아이 없음":
-        # 기존 추천 메타데이터는 자녀 나이 값이 없을 수도 있습니다.
         child_age = child_group
+
     submitted = st.form_submit_button("여행지 검색", type="primary", use_container_width=True)
 
 if "search_result" not in st.session_state:
