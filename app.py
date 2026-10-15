@@ -718,6 +718,104 @@ def build_location_itinerary(
     return itinerary
 
 
+# 6-17: 체류시간과 이동시간을 반영한 참고용 하루 일정표.
+# 실시간 도로/대중교통 경로 API가 없으므로 실제 소요시간이 아닌 보수적 추정입니다.
+def _visit_minutes(activity: dict, pace: str) -> int:
+    kind = str(activity.get("type", ""))
+    name = str(activity.get("name", ""))
+    if kind in ("점심 식사", "저녁 식사", "식사"):
+        base = 75
+    elif kind == "카페·휴식":
+        base = 65
+    elif any(word in name for word in ("테마파크", "놀이공원", "아쿠아리움", "동물원", "워터파크")):
+        base = 150
+    elif any(word in name for word in ("체험", "박물관", "미술관", "과학관", "공방")):
+        base = 110
+    else:
+        base = 85
+    if pace == "여유롭게":
+        return int(base * 1.2)
+    if pace == "빠르게":
+        return int(base * 0.85)
+    return base
+
+
+def _estimated_transfer_minutes(previous: dict, current: dict, transport: str) -> tuple[int, str]:
+    distance = _straight_distance_meters(
+        previous.get("longitude"), previous.get("latitude"),
+        current.get("longitude"), current.get("latitude"),
+    )
+    public = _transport_profile(transport)["public"]
+    if distance is None:
+        return (40 if public else 25), "좌표 없음: 임시 이동시간"
+    km = distance / 1000
+    if public:
+        # 접근/대기/환승 여유를 포함한 참고용 추정. 노선 존재 여부 미확인.
+        minutes = 20 + km / 15 * 60
+    else:
+        # 직선거리를 도로거리로 환산하는 간이 추정(1.35배), 평균 32km/h 가정.
+        minutes = 10 + (km * 1.35) / 32 * 60
+    return max(10, min(240, int(round(minutes / 5) * 5))), f"직선거리 {km:.1f}km 기준 추정"
+
+
+def _clock(minutes: int) -> str:
+    return f"{(minutes // 60) % 24:02d}:{minutes % 60:02d}"
+
+
+def _schedule_for_day(activities: list[dict], transport: str, start_hour: int, pace: str) -> tuple[list[dict], int, int]:
+    visits = [a for a in activities if a.get("type") in ("관광", "식사", "점심 식사", "저녁 식사", "카페·휴식")]
+    current = start_hour * 60
+    rows = []
+    travel_total = 0
+    previous = None
+    for activity in visits:
+        if previous is not None:
+            transfer, basis = _estimated_transfer_minutes(previous, activity, transport)
+            rows.append({"시간": f"{_clock(current)}–{_clock(current + transfer)}", "구분": "이동 (추정)",
+                         "장소/활동": f"{previous.get('name', '')} → {activity.get('name', '')}", "소요": f"약 {transfer}분", "비고": basis})
+            current += transfer
+            travel_total += transfer
+        stay = _visit_minutes(activity, pace)
+        rows.append({"시간": f"{_clock(current)}–{_clock(current + stay)}", "구분": activity.get("type", "방문"),
+                     "장소/활동": activity.get("name", ""), "소요": f"약 {stay}분", "비고": "체류시간 가정"})
+        current += stay
+        previous = activity
+    return rows, current, travel_total
+
+
+def render_time_schedule(itinerary: list, transport: str) -> None:
+    st.markdown("#### 예상 시간표 · 일정 현실성 점검")
+    st.caption("선택한 일정의 방문 순서를 기준으로 체류시간과 이동시간을 추정합니다. 실제 도로·버스 노선, 영업시간, 예약시간은 확인하지 않습니다.")
+    a, b, c = st.columns(3)
+    with a:
+        start_hour = st.selectbox("하루 시작 시각", list(range(7, 13)), index=2, format_func=lambda h: f"{h:02d}:00", key="trip_617_start")
+    with b:
+        end_hour = st.selectbox("하루 종료 희망 시각", list(range(16, 24)), index=4, format_func=lambda h: f"{h:02d}:00", key="trip_617_end")
+    with c:
+        pace = st.selectbox("여행 속도", ["여유롭게", "보통", "빠르게"], index=1, key="trip_617_pace")
+    if start_hour >= end_hour:
+        st.warning("종료 희망 시각을 시작 시각보다 늦게 선택해 주세요.")
+        return
+    for day, activities in itinerary:
+        rows, finish, travel = _schedule_for_day(activities, transport, start_hour, pace)
+        if not rows:
+            st.info(f"{day}일 차: 방문 장소가 없어 시간표를 만들 수 없습니다.")
+            continue
+        with st.expander(f"{day}일 차 · 예상 종료 {_clock(finish)} · 이동 약 {travel}분", expanded=(day == 1)):
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+            if finish > end_hour * 60:
+                st.warning(f"희망 종료 시각보다 약 {finish - end_hour * 60}분 늦습니다. 방문 장소를 줄이거나 시작 시각을 조정하세요.")
+            elif finish > end_hour * 60 - 30:
+                st.info("종료 시각까지 여유가 30분 미만입니다. 휴식·주차·대기시간을 추가로 고려하세요.")
+            else:
+                st.success(f"희망 종료 시각까지 약 {end_hour * 60 - finish}분의 여유가 있습니다(추정 기준).")
+            if travel >= 120:
+                st.warning("하루 이동시간이 2시간 이상으로 추정됩니다. 동선을 조정하는 것이 좋습니다.")
+            if not any(a.get("type") in ("점심 식사", "저녁 식사", "식사") for a in activities):
+                st.warning("식사 장소가 없습니다.")
+            st.caption("시간표는 일정 편집 시 자동 재계산됩니다. 숙소 출발·복귀, 입장 대기, 교통 체증, 실제 운영시간은 미포함입니다.")
+
+
 EDITABLE_PLACE_TYPES = {"관광", "식사", "점심 식사", "저녁 식사", "카페·휴식"}
 
 
@@ -2046,6 +2144,7 @@ if search_result:
             st.session_state.trip_edit_last_change = ""
         location_itinerary = st.session_state.trip_editable_itinerary
         render_editable_itinerary(location_itinerary)
+        render_time_schedule(location_itinerary, selected_transport)
         with st.expander("일정 추천 품질 점검", expanded=False):
             st.caption("방문 장소 중복·긴 직선 이동·식사 누락을 점검합니다. 실제 도로 경로, 영업시간, 리뷰 평점은 검증하지 않습니다.")
             quality_notes = _itinerary_quality_notes(location_itinerary, selected_transport)
