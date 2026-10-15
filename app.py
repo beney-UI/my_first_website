@@ -1821,10 +1821,28 @@ if search_result:
     )
 
     st.subheader(f"{query} 여행 일정")
-    st.caption(
-        f"동행 유형: {selected_party}" + (f" / {selected_child_group}" if selected_child_group else "") + f" · 기간: {selected_duration} · "
-        f"이동: {selected_transport} · 스타일: {selected_style}"
-        + (f" · 자녀 {len(selected_child_ages)}명: {', '.join(selected_child_ages)}" if selected_child_ages else "")
+    # 6-12: 여행 조건을 취소선처럼 보이는 한 줄 caption 대신 구분된 정보 칩으로 표시합니다.
+    # HTML 값은 escape 처리하고 텍스트 장식은 명시적으로 제거합니다.
+    trip_summary_items = [
+        ("동행 유형", selected_party),
+        ("여행 기간", selected_duration),
+        ("이동 수단", selected_transport),
+        ("여행 스타일", selected_style),
+    ]
+    if selected_child_ages:
+        trip_summary_items.append(("자녀", f"{len(selected_child_ages)}명 · {', '.join(selected_child_ages)}"))
+    summary_chips = "".join(
+        '<span style="display:inline-block;background:#ffffff;border:1px solid #dce8e6;'
+        'border-radius:7px;padding:7px 11px;color:#183b43;'
+        'text-decoration:none !important;line-height:1.5;white-space:normal;">'
+        f'<strong style="text-decoration:none !important;">{escape(label)}</strong> '
+        f'<span style="text-decoration:none !important;">{escape(str(value))}</span></span>'
+        for label, value in trip_summary_items
+    )
+    st.markdown(
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 22px;'
+        'text-decoration:none !important;">' + summary_chips + '</div>',
+        unsafe_allow_html=True,
     )
 
     location_itinerary = []
