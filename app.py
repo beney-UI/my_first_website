@@ -54,6 +54,58 @@ MAX_TRAVEL_DAYS = 30
 # 5-7: 간결한 동행 유형과 여행 구성에 따른 일정 추천
 TRAVEL_PARTIES = ("혼자 여행", "연인·친구와 여행", "우리 가족 여행", "부모님과 여행", "3대 가족 여행")
 FAMILY_CHILD_OPTIONS = ("아이 없음", "영유아 (0~5세)", "초등학생 (6~12세)", "중·고등학생")
+CHILD_AGE_OPTIONS = ("0~2세", "3~5세", "6~9세", "10~12세", "13~15세", "16~18세", "19세 이상")
+
+
+def child_age_bucket(age: str) -> str:
+    if age in ("0~2세", "3~5세"):
+        return "영유아 (0~5세)"
+    if age in ("6~9세", "10~12세"):
+        return "초등학생 (6~12세)"
+    if age in ("13~15세", "16~18세"):
+        return "중·고등학생"
+    return "성인"
+
+
+def child_profiles_score(place: Place, ages: list[str]) -> int:
+    """여러 연령대가 함께 즐길 수 있는 장소를 우선합니다. 실제 입장 연령 제한 판정은 아닙니다."""
+    if not ages:
+        return 0
+    text = " ".join(str(place.get(k) or "") for k in ("name", "category", "description"))
+    recommended = place.get("recommended_age_groups", []) or []
+    if isinstance(recommended, str):
+        recommended = [recommended]
+    tags = place.get("recommendation_tags", []) or []
+    if isinstance(tags, str):
+        tags = [tags]
+    scores = []
+    for age in ages:
+        bucket = child_age_bucket(age)
+        score = 0
+        if bucket in recommended or age in recommended:
+            score += 12
+        if bucket == "영유아 (0~5세)":
+            if any(w in text for w in ("수족관", "아쿠아리움", "동물", "공원", "정원", "키즈", "어린이", "유아")):
+                score += 14
+            if any(w in text for w in ("등산", "암벽", "트레킹", "익스트림", "급경사")):
+                score -= 22
+            if "child_friendly" in tags or "easy_access" in tags:
+                score += 8
+        elif bucket == "초등학생 (6~12세)":
+            if any(w in text for w in ("체험", "과학", "박물관", "동물", "수족관", "놀이", "자연", "전시")):
+                score += 13
+        elif bucket == "중·고등학생":
+            if any(w in text for w in ("체험", "역사", "박물관", "전망", "케이블카", "전시", "레저", "과학")):
+                score += 13
+            if any(w in text for w in ("유아전용", "영아전용", "키즈카페")):
+                score -= 10
+        else:
+            if any(w in text for w in ("역사", "미술", "전시", "박물관", "문화", "전망", "산책")):
+                score += 10
+        scores.append(score)
+    # 한 아이에게만 맞는 장소보다 전원이 함께 즐길 수 있는 장소를 우선합니다.
+    return round(0.65 * min(scores) + 0.35 * sum(scores) / len(scores))
+
 
 
 def companion_for_media(party: str, child_group: str | None) -> str:
@@ -72,7 +124,7 @@ def companion_for_media(party: str, child_group: str | None) -> str:
 def attractions_per_day_for(party: str, style: str, child_group: str | None) -> int:
     if party in ("부모님과 여행", "3대 가족 여행"):
         return 1
-    if child_group == "영유아 (0~5세)":
+    if child_group and "영유아 (0~5세)" in child_group:
         return 1
     return 1 if style in ("휴식 중심", "맛집 중심") else 2
 
@@ -98,9 +150,9 @@ def party_place_score(place: Place, party: str, child_group: str | None) -> int:
     return 0
 
 
-def rank_places_for_party(places, companion, style, transport, age, party, child_group):
+def rank_places_for_party(places, companion, style, transport, age, party, child_group, child_ages=None):
     return [place for _, place in sorted(enumerate(places), key=lambda item: (
-        -(score_place(item[1], companion, style, transport, age) + party_place_score(item[1], party, child_group)),
+        -(score_place(item[1], companion, style, transport, age) + party_place_score(item[1], party, child_group) + child_profiles_score(item[1], child_ages or [])),
         item[0],
     ))]
 
@@ -396,7 +448,7 @@ def search_kakao_edit_places(keyword: str, api_key: str, longitude: str, latitud
 def render_place_search_editor(itinerary: list, destination: str) -> None:
     """카카오 장소 검색 결과를 기존 일정에 추가하거나 기존 장소와 교체합니다."""
     st.markdown("#### 장소 검색 · 추가 · 교체")
-    st.caption("카카오 로컬 API의 실제 검색 결과를 사용합니다. 추가·교체한 장소는 지도에 반영됩니다.")
+    st.caption("카카오 로컬 API의 실제 검색 결과를 사용합니다. 추가·교체한 장소는 나만의 여행 일정·지도·후기·영상에 함께 반영됩니다.")
     if not itinerary:
         return
     with st.form("trip_place_search_form"):
@@ -475,6 +527,13 @@ def render_place_search_editor(itinerary: list, destination: str) -> None:
             # 이동 참고 문구 앞에 추가합니다.
             insert_at = next((i for i, a in enumerate(activities) if a.get("type") == "이동 참고"), len(activities))
             activities.insert(insert_at, new_activity)
+        # 편집 결과를 세션의 단일 원본에 명시적으로 저장합니다.
+        # 지도와 일정표, 후기/영상이 모두 이 상태를 읽습니다.
+        st.session_state.trip_editable_itinerary = deepcopy(itinerary)
+        st.session_state.trip_edit_last_change = (
+            f"{itinerary[day_index][0]}일 차 · {new_activity['name']} "
+            + ("교체" if action == "기존 장소 교체" else "추가")
+        )
         st.session_state.trip_edit_search_results = []
         st.session_state.trip_edit_search_error = ""
         st.rerun()
@@ -512,13 +571,17 @@ def render_editable_itinerary(itinerary: list[tuple[int, list[dict[str, str]]]])
                 if up:
                     previous = editable_indices[visit_number - 2]
                     activities[previous], activities[index] = activities[index], activities[previous]
+                    st.session_state.trip_editable_itinerary = deepcopy(itinerary)
                     st.rerun()
                 if down:
                     following = editable_indices[visit_number]
                     activities[following], activities[index] = activities[index], activities[following]
+                    st.session_state.trip_editable_itinerary = deepcopy(itinerary)
                     st.rerun()
                 if delete:
                     activities.pop(index)
+                    st.session_state.trip_editable_itinerary = deepcopy(itinerary)
+                    st.session_state.trip_edit_last_change = f"{day}일 차 · {activity.get('name', '장소')} 삭제"
                     st.rerun()
         for activity in activities:
             if not is_editable_visit(activity) and activity.get("type") == "이동 참고":
@@ -697,13 +760,17 @@ def render_imported_trip() -> None:
                 if c1.button("↑ 위로", key=f"imp_up_{day_index}_{index}", disabled=number == 1, use_container_width=True):
                     previous = indices[number - 2]
                     activities[previous], activities[index] = activities[index], activities[previous]
+                    st.session_state.trip_editable_itinerary = deepcopy(itinerary)
                     st.rerun()
                 if c2.button("↓ 아래로", key=f"imp_down_{day_index}_{index}", disabled=number == len(indices), use_container_width=True):
                     following = indices[number]
                     activities[following], activities[index] = activities[index], activities[following]
+                    st.session_state.trip_editable_itinerary = deepcopy(itinerary)
                     st.rerun()
                 if c3.button("삭제", key=f"imp_delete_{day_index}_{index}", use_container_width=True):
                     activities.pop(index)
+                    st.session_state.trip_editable_itinerary = deepcopy(itinerary)
+                    st.session_state.trip_edit_last_change = f"{day}일 차 · {activity.get('name', '장소')} 삭제"
                     st.rerun()
     render_trip_exports(imported, destination, duration, "imported")
     # 지도의 위젯 키는 본 검색 결과 지도와 구분합니다.
@@ -1306,7 +1373,7 @@ st.markdown(
 # PC에서는 3열 × 2행 균등 배열, 모바일에서는 한 열로 표시합니다.
 # Streamlit 폼은 제출 전 선택 변경을 반영하지 않으므로 자녀 연령을 항상 표시하되
 # 가족 여행 유형일 때만 일정 추천에 적용합니다.
-with st.form("destination_search"):
+with st.container():
     row1_destination, row1_party, row1_days = st.columns(3, gap="medium")
     with row1_destination:
         destination_query = st.text_input(
@@ -1333,12 +1400,26 @@ with st.form("destination_search"):
     with row2_style:
         travel_style = st.selectbox("여행 스타일", TRAVEL_STYLES)
     with row2_child:
-        child_choice = st.selectbox(
-            "자녀 연령 (가족 여행만 적용)", FAMILY_CHILD_OPTIONS,
-            index=0,
-            key="trip_child_group_v58",
-            help="우리 가족 여행 또는 3대 가족 여행을 선택한 경우에만 일정 추천에 반영됩니다.",
+        family_party = party in ("우리 가족 여행", "3대 가족 여행")
+        child_count = st.number_input(
+            "자녀 수 (가족 여행만 적용)", min_value=0, max_value=10,
+            value=0, step=1, key="trip_child_count_v66",
+            disabled=not family_party,
+            help="0~10명까지 입력할 수 있습니다. 가족 여행 유형에만 반영됩니다.",
         )
+
+    child_ages = []
+    if family_party and int(child_count) > 0:
+        st.markdown("**자녀별 연령 선택**")
+        age_columns = st.columns(3, gap="medium")
+        for idx in range(int(child_count)):
+            with age_columns[idx % 3]:
+                age = st.selectbox(
+                    f"자녀 {idx + 1} 연령", CHILD_AGE_OPTIONS,
+                    key=f"trip_child_age_{idx}_v66",
+                )
+                child_ages.append(age)
+        st.caption("여러 연령대가 함께 즐길 수 있는 관광지를 우선 추천합니다. 실제 입장·관람 연령 제한은 방문 전 확인하세요.")
 
     st.caption(f"선택한 여행 기간: {duration}")
     with st.expander("후기 · 영상 상세 옵션", expanded=False):
@@ -1348,10 +1429,11 @@ with st.form("destination_search"):
         with advanced_right:
             video_order = st.selectbox("YouTube 정렬", VIDEO_ORDER_OPTIONS)
 
-    child_group = child_choice if party in ("우리 가족 여행", "3대 가족 여행") else None
+    child_groups = list(dict.fromkeys(child_age_bucket(age) for age in child_ages))
+    child_group = ", ".join(child_groups) if child_groups else None
     companion = companion_for_media(party, child_group)
-    child_age = child_group if child_group and child_group != "아이 없음" else None
-    submitted = st.form_submit_button("여행지 검색", type="primary", use_container_width=True)
+    child_age = child_groups[0] if len(child_groups) == 1 else None
+    submitted = st.button("여행지 검색", type="primary", use_container_width=True)
 
 if "search_result" not in st.session_state:
     st.session_state.search_result = None
@@ -1393,6 +1475,7 @@ if submitted:
             "companion": companion,
             "party": party,
             "child_group": child_group,
+            "child_ages": child_ages,
             "duration": duration,
             "transport": transport,
             "travel_style": travel_style,
@@ -1540,13 +1623,14 @@ if search_result:
     actual_restaurants = restaurant_response.get("places", [])
     selected_party = search_result.get("party", "우리 가족 여행")
     selected_child_group = search_result.get("child_group")
+    selected_child_ages = search_result.get("child_ages", [])
     ranked_attractions = rank_places_for_party(
         actual_attractions,
         selected_companion,
         selected_style,
         selected_transport,
         selected_age,
-        selected_party, selected_child_group,
+        selected_party, selected_child_group, selected_child_ages,
     )
     ranked_restaurants = rank_places_for_party(
         actual_restaurants,
@@ -1554,14 +1638,14 @@ if search_result:
         selected_style,
         selected_transport,
         selected_age,
-        selected_party, selected_child_group,
+        selected_party, selected_child_group, selected_child_ages,
     )
 
     st.subheader(f"{query} 여행 일정")
     st.caption(
         f"동행 유형: {selected_party}" + (f" / {selected_child_group}" if selected_child_group else "") + f" · 기간: {selected_duration} · "
         f"이동: {selected_transport} · 스타일: {selected_style}"
-        + (f" · 아이 연령: {selected_age}" if selected_age else "")
+        + (f" · 자녀 {len(selected_child_ages)}명: {', '.join(selected_child_ages)}" if selected_child_ages else "")
     )
 
     location_itinerary = []
@@ -1613,8 +1697,14 @@ if search_result:
             "실제 영업 여부는 확인하지 않았습니다."
         )
         location_itinerary = st.session_state.trip_editable_itinerary
+        # 장소 검색/적용을 먼저 처리해 아래 일정표가 최신 세션 상태를 표시하도록 합니다.
+        with st.expander("장소 검색 · 일정에 추가 또는 교체", expanded=False):
+            render_place_search_editor(location_itinerary, query)
+        if st.session_state.get("trip_edit_last_change"):
+            st.success("일정 반영 완료: " + st.session_state.trip_edit_last_change)
+            st.session_state.trip_edit_last_change = ""
+        location_itinerary = st.session_state.trip_editable_itinerary
         render_editable_itinerary(location_itinerary)
-        render_place_search_editor(location_itinerary, query)
         if len(course_attractions) < days * attractions_per_day:
             st.info(
                 f"{days}일 일정에 필요한 관광지가 충분히 검색되지 않았습니다. "
