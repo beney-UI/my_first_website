@@ -502,6 +502,45 @@ def _select_thematic_nearby(
 # 6-15: 동일 장소 중복 제거 및 실제 좌표 기반 일정 품질 검증
 MAX_RECOMMENDATION_DETOUR_M = 10000
 
+
+def _transport_profile(transport: str) -> dict:
+    """직선거리 기반의 보수적 휴리스틱. 대중교통 노선·시간을 검증하지 않습니다."""
+    public = any(token in str(transport) for token in ("대중교통", "버스", "지하철", "기차"))
+    return {
+        "public": public,
+        "attractions_radius": 4500 if public else 18000,
+        "food_radius": 1600 if public else 10000,
+        "cafe_radius": 1600 if public else 10000,
+        "max_attractions": 2 if public else 4,
+        "warning_radius": 4500 if public else 18000,
+    }
+
+
+def _transport_order_attractions(places: list[dict], transport: str, days: int, count: int) -> list[dict]:
+    """일자별 권역을 형성해 장거리 이동을 줄입니다. 추천 상위 후보 우선."""
+    profile = _transport_profile(transport)
+    remaining = list(places)
+    result = []
+    for _ in range(days):
+        if not remaining:
+            break
+        anchor = remaining.pop(0)
+        day_places = [anchor]
+        for _ in range(count - 1):
+            if not remaining:
+                break
+            distances = [(_place_distance(anchor, place), i) for i, place in enumerate(remaining)]
+            near = [(dist, i) for dist, i in distances if dist <= profile["attractions_radius"]]
+            if near:
+                _, idx = min(near)
+            else:
+                # 반경 안 후보가 없다면 가장 가까운 후보로 대체하며 품질 점검에 표시합니다.
+                _, idx = min(distances)
+            day_places.append(remaining.pop(idx))
+        result.extend(day_places)
+    return result
+
+
 def _place_identity(place: dict) -> str:
     """동일 상호·주소는 한 여행 일정에서 한 번만 추천합니다."""
     import re
@@ -526,10 +565,11 @@ def _unique_places(places: list[dict]) -> list[dict]:
     return result
 
 
-def _itinerary_quality_notes(itinerary: list) -> list[str]:
+def _itinerary_quality_notes(itinerary: list, transport: str = "자차") -> list[str]:
     """추천 품질 참고 사항만 표시하며, 실제 도로 이동시간은 추정하지 않습니다."""
     notes = []
     seen = set()
+    warning_radius = _transport_profile(transport)["warning_radius"]
     for day, activities in itinerary:
         visits = [a for a in activities if a.get("type") in EDITABLE_PLACE_TYPES and a.get("name") != "주변 장소 검색 결과 없음"]
         for activity in visits:
@@ -539,7 +579,7 @@ def _itinerary_quality_notes(itinerary: list) -> list[str]:
             seen.add(identity)
         for before, after in zip(visits, visits[1:]):
             dist = _straight_distance_meters(before.get("longitude"), before.get("latitude"), after.get("longitude"), after.get("latitude"))
-            if dist is not None and dist > MAX_RECOMMENDATION_DETOUR_M:
+            if dist is not None and dist > warning_radius:
                 notes.append(f"{day}일 차: {before.get('name')} → {after.get('name')} 직선거리 약 {dist / 1000:.1f}km로 이동 부담이 있을 수 있습니다.")
         if not any(a.get("type") in ("식사", "점심 식사", "저녁 식사") for a in visits):
             notes.append(f"{day}일 차: 식사 장소가 배치되지 않았습니다.")
@@ -569,7 +609,7 @@ def build_location_itinerary(
 ) -> list[tuple[int, list[dict[str, str]]]]:
     days = duration_to_days(duration)
     plan = combined_style_plan(travel_style, party, child_group)
-    attractions_per_day = plan["attractions"]
+    attractions_per_day = min(plan["attractions"], _transport_profile(transport)["max_attractions"])
     # 같은 관광지가 검색 결과에 반복 등장해도 하루/다른 날짜에 중복 배치하지 않습니다.
     unique_groups = []
     seen_attractions = set()
@@ -580,7 +620,12 @@ def build_location_itinerary(
         if identity:
             seen_attractions.add(identity)
         unique_groups.append(group)
-    groups = _cluster_attraction_groups(unique_groups, attractions_per_day)
+    # 선택 이동수단에 맞춰 일자별 관광지 권역을 묶습니다.
+    ordered_attractions = _transport_order_attractions(
+        [g["attraction"] for g in unique_groups], transport, days, attractions_per_day
+    )
+    group_lookup = {_place_identity(g["attraction"]): g for g in unique_groups}
+    groups = [group_lookup[_place_identity(a)] for a in ordered_attractions if _place_identity(a) in group_lookup]
     itinerary = []
     group_index = 0
     used_food: set[str] = set()
@@ -614,13 +659,18 @@ def build_location_itinerary(
             mood_cafes = _extra_thematic_candidates(last, destination, "cafe")
             food_candidates = _unique_places(regional_food + restaurants)
             cafe_candidates = _unique_places(mood_cafes + cafes)
-            # 우선 10km 내 후보를 사용하고, 없는 경우에만 검색 반경 전체로 확대합니다.
-            nearby_food = [p for p in food_candidates if _place_distance(first, p) <= MAX_RECOMMENDATION_DETOUR_M]
-            nearby_cafes = [p for p in cafe_candidates if _place_distance(last, p) <= MAX_RECOMMENDATION_DETOUR_M]
+            # 자차/대중교통별 주변 후보 탐색 반경을 구분합니다.
+            profile = _transport_profile(transport)
+            nearby_food = [p for p in food_candidates if _place_distance(first, p) <= profile["food_radius"]]
+            nearby_cafes = [p for p in cafe_candidates if _place_distance(last, p) <= profile["cafe_radius"]]
             if nearby_food:
                 food_candidates = nearby_food
+            elif profile["public"]:
+                food_candidates = []  # 먼 음식점을 무리하게 추천하지 않음
             if nearby_cafes:
                 cafe_candidates = nearby_cafes
+            elif profile["public"]:
+                cafe_candidates = []
 
             def add_food(anchor: dict, kind: str) -> dict | None:
                 place, matched = _select_thematic_nearby(food_candidates, anchor, used_food, "food", destination)
@@ -662,7 +712,7 @@ def build_location_itinerary(
 
         activities.append({
             "type": "이동 참고", "name": transport, "address": "", "url": "",
-            "reason": f"{travel_style} 기준으로 구성한 일정입니다. 관광지 간 거리는 직선거리 참고이며 실제 도로 경로·이동시간·영업시간·체험 가능 여부는 확인되지 않았습니다.",
+            "reason": f"{travel_style} / {transport} 기준으로 이동 권역과 방문 밀도를 조정했습니다. 직선거리만 참고하며 실제 대중교통 노선·환승·운행시간, 도로 경로·영업시간은 확인되지 않았습니다.",
         })
         itinerary.append((day, activities))
     return itinerary
@@ -1943,7 +1993,7 @@ if search_result:
     if ranked_attractions:
         days = duration_to_days(selected_duration)
         plan = combined_style_plan(selected_style, selected_party, selected_child_group)
-        attractions_per_day = plan["attractions"]
+        attractions_per_day = min(plan["attractions"], _transport_profile(selected_transport)["max_attractions"])
         # 전체 거리순 재정렬은 동행 유형별 추천 순위를 무너뜨릴 수 있습니다.
         # 우선순위에 따라 장소를 선택하고, 하루 단위에서만 가까운 순서를 참고합니다.
         style_ranked_attractions = prioritize_experiences(ranked_attractions) if plan["experience"] else ranked_attractions
@@ -1998,12 +2048,12 @@ if search_result:
         render_editable_itinerary(location_itinerary)
         with st.expander("일정 추천 품질 점검", expanded=False):
             st.caption("방문 장소 중복·긴 직선 이동·식사 누락을 점검합니다. 실제 도로 경로, 영업시간, 리뷰 평점은 검증하지 않습니다.")
-            quality_notes = _itinerary_quality_notes(location_itinerary)
+            quality_notes = _itinerary_quality_notes(location_itinerary, selected_transport)
             if quality_notes:
                 for note in quality_notes:
                     st.warning(note)
             else:
-                st.success("점검한 항목에서 중복 장소, 10km 초과 직선 이동, 식사 누락이 발견되지 않았습니다.")
+                st.success("점검한 항목에서 중복 장소, 이동 수단별 권장 거리 초과, 식사 누락이 발견되지 않았습니다.")
         if len(course_attractions) < days * attractions_per_day:
             st.info(
                 f"{days}일 일정에 필요한 관광지가 충분히 검색되지 않았습니다. "
