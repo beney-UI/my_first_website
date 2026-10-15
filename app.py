@@ -362,6 +362,65 @@ def _local_food_keywords(destination: str) -> tuple[str, ...]:
     return ()
 
 
+# 6-11: 기존 주변 후보만 정렬하지 않고 지역 메뉴/감성 카페를 별도로 검색합니다.
+# 카카오 장소명/분류에 기반한 후보 검색이며 실제 메뉴나 분위기 검증은 아닙니다.
+REGIONAL_SEARCH_TERMS = {
+    "제주": ("고기국수", "흑돼지", "갈치조림", "보말칼국수", "해물뚝배기"),
+    "속초": ("물회", "아바이순대", "생선구이", "섭국", "오징어순대"),
+    "강릉": ("초당순두부", "장칼국수", "감자옹심이", "막국수"),
+    "부산": ("돼지국밥", "밀면", "낙곱새", "복국"),
+    "전주": ("비빔밥", "콩나물국밥", "한정식"),
+    "경주": ("쌈밥", "떡갈비", "한우"),
+    "여수": ("게장", "서대회", "장어탕"),
+    "통영": ("충무김밥", "굴국밥", "멍게비빔밥"),
+}
+FRANCHISE_HINTS = ("처갓집", "교촌", "bhc", "bbq", "굽네", "맘스터치", "버거킹", "맥도날드", "롯데리아", "도미노", "피자헛", "스타벅스", "투썸", "이디야", "메가커피", "컴포즈")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _kakao_thematic_query(api_key: str, query: str, category_code: str, longitude: str, latitude: str) -> list[dict]:
+    if not api_key or not longitude or not latitude:
+        return []
+    params = {"query": query, "category_group_code": category_code, "x": longitude, "y": latitude,
+              "radius": 12000, "sort": "distance", "size": 15}
+    try:
+        req = Request("https://dapi.kakao.com/v2/local/search/keyword.json?" + urlencode(params),
+                      headers={"Authorization": f"KakaoAK {api_key}"})
+        with urlopen(req, timeout=7) as response:
+            documents = json.load(response).get("documents", [])
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        return []
+    return [d for d in documents if d.get("category_group_code") == category_code]
+
+
+def _extra_thematic_candidates(anchor: dict, destination: str, kind: str) -> list[dict]:
+    coords = _valid_map_coordinates(anchor)
+    if coords is None:
+        return []
+    lat, lon = coords
+    if kind == "food":
+        region_terms = next((v for region, v in REGIONAL_SEARCH_TERMS.items() if region in destination), None)
+        terms = region_terms or _local_food_keywords(destination)[:4]
+        code = "FD6"
+    else:
+        terms = ("오션뷰 카페", "감성 카페", "베이커리 카페", "정원 카페")
+        code = "CE7"
+    key = get_kakao_api_key()
+    found = []
+    seen = set()
+    for term in terms[:5]:
+        for d in _kakao_thematic_query(key, term, code, str(lon), str(lat)):
+            ident = d.get("id") or (d.get("place_name"), d.get("address_name"))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            found.append({"name": d.get("place_name", ""), "address": d.get("road_address_name") or d.get("address_name", ""),
+                          "category": d.get("category_name", ""), "description": term,
+                          "x": d.get("x"), "y": d.get("y"), "detail_url": d.get("place_url", ""),
+                          "recommendation_reason": "지역 음식/카페 키워드로 검색된 후보입니다. 실제 메뉴·분위기·영업시간은 확인해 주세요."})
+    return found
+
+
 def _select_thematic_nearby(
     candidates: list[dict], anchor: dict, used: set[str], kind: str, destination: str
 ) -> tuple[dict | None, bool]:
@@ -378,10 +437,12 @@ def _select_thematic_nearby(
         index, place = item
         text = " ".join(str(place.get(k) or "") for k in ("name", "category", "description"))
         matched = sum(1 for word in keywords if word in text)
+        franchise = any(word.casefold() in str(place.get("name", "")).casefold() for word in FRANCHISE_HINTS)
         distance = _place_distance(anchor, place)
         # 3 km ≈ 20 points, 10 km ≈ 67 points: avoid extreme detours for thematic places.
         distance_penalty = min(distance / 150.0, 100.0) if distance != float("inf") else 60.0
-        return (matched * 85.0 - distance_penalty, -index)
+        # 지역 음식/감성 후보가 있으면 일반 프랜차이즈보다 우선합니다.
+        return (matched * 120.0 - distance_penalty - (250 if franchise else 0), -index)
 
     selected = max(enumerate(available), key=evaluate)[1]
     text = " ".join(str(selected.get(k) or "") for k in ("name", "category", "description"))
@@ -455,7 +516,8 @@ def build_location_itinerary(
                 "한국관광공사 관광지 검색 결과입니다.",
             )
             first_restaurants = [place for group in day_groups for place in group.get("restaurants", [])]
-            lunch, lunch_matched = _select_thematic_nearby(first_restaurants, first_group["attraction"], used_food, "food", destination)
+            regional_restaurants = _extra_thematic_candidates(first_group["attraction"], destination, "food")
+            lunch, lunch_matched = _select_thematic_nearby(regional_restaurants + first_restaurants, first_group["attraction"], used_food, "food", destination)
             if lunch:
                 add_activity("점심 식사", lunch, "지역 대표 음식 키워드가 장소 정보에서 확인된 후보입니다. 메뉴·맛·영업시간은 별도 확인이 필요합니다." if lunch_matched else "지역 대표 음식 후보를 찾지 못해 이동 동선상 가까운 음식점을 배치했습니다. 메뉴·영업시간은 확인이 필요합니다.")
             elif first_group.get("attraction"):
@@ -477,11 +539,12 @@ def build_location_itinerary(
 
             cafes = [place for group in day_groups for place in group.get("cafes", [])]
             last_attraction = day_groups[-1]["attraction"]
-            cafe, cafe_matched = _select_thematic_nearby(cafes, last_attraction, used_cafes, "cafe", destination)
+            mood_cafes = _extra_thematic_candidates(last_attraction, destination, "cafe")
+            cafe, cafe_matched = _select_thematic_nearby(mood_cafes + cafes, last_attraction, used_cafes, "cafe", destination)
             if cafe:
                 add_activity("카페·휴식", cafe, "감성·전망·디저트 관련 키워드가 장소 정보에서 확인된 카페 후보입니다. 실제 분위기·영업시간은 확인이 필요합니다." if cafe_matched else "감성 키워드 후보가 없어 이동 동선상 가까운 카페를 배치했습니다. 실제 분위기·영업시간은 확인이 필요합니다.")
                 if travel_style == "휴식 중심":
-                    extra_cafe, _ = _select_thematic_nearby(cafes, cafe, used_cafes, "cafe", destination)
+                    extra_cafe, _ = _select_thematic_nearby(mood_cafes + cafes, cafe, used_cafes, "cafe", destination)
                     if extra_cafe:
                         add_activity("카페·휴식", extra_cafe, "첫 카페와 가까운 추가 휴식 장소 후보입니다.")
             else:
@@ -495,7 +558,7 @@ def build_location_itinerary(
 
             if travel_style == "맛집 중심":
                 dinner_anchor = cafe or last_attraction
-                dinner, dinner_matched = _select_thematic_nearby(first_restaurants, dinner_anchor, used_food, "food", destination)
+                dinner, dinner_matched = _select_thematic_nearby(regional_restaurants + first_restaurants, dinner_anchor, used_food, "food", destination)
                 if dinner:
                     add_activity("저녁 식사", dinner, "지역 대표 음식 키워드가 확인된 저녁 식사 후보입니다. 메뉴·저녁 영업 여부는 확인이 필요합니다." if dinner_matched else "이동 동선상 가까운 저녁 식사 후보입니다. 메뉴·영업시간은 확인이 필요합니다.")
 
