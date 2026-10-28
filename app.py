@@ -457,40 +457,80 @@ def _pet_status(place: dict) -> str:
 
 
 def _pet_keyword_candidates(anchor: dict, kind: str) -> list[dict]:
-    """Kakao 키워드 기반 후보. 키워드 검색 결과 자체는 동반 가능 인증이 아님."""
+    """Kakao keyword search: first category-specific, then unclassified results.
+
+    Kakao does not expose verified pet-admission fields. These are candidates only.
+    """
     coords = _valid_map_coordinates(anchor)
     if coords is None:
         return []
     lat, lon = coords
+    api_key = get_kakao_api_key()
+    if not api_key:
+        return []
     code = {"tour": "AT4", "food": "FD6", "cafe": "CE7"}[kind]
-    terms = {"tour": ("반려견 동반 관광지", "반려견 동반 공원", "애견 동반 여행지"),
-             "food": ("반려견 동반 식당", "애견 동반 음식점", "반려동물 동반 식당"),
-             "cafe": ("반려견 동반 카페", "애견 동반 카페")}[kind]
+    terms = {
+        "tour": ("반려견 동반 관광지", "애견 동반 공원", "반려견 동반 산책", "애견 동반 여행지"),
+        "food": ("반려견 동반 식당", "애견 동반 음식점", "반려동물 동반 식당"),
+        "cafe": ("반려견 동반 카페", "애견 동반 카페"),
+    }[kind]
     result, seen = [], set()
     for term in terms:
-        for doc in _kakao_thematic_query(get_kakao_api_key(), term, code, str(lon), str(lat)):
-            identity = doc.get("id") or (doc.get("place_name"), doc.get("address_name"))
-            if identity in seen:
-                continue
-            seen.add(identity)
-            result.append({
-                "name": doc.get("place_name", ""),
-                "address": doc.get("road_address_name") or doc.get("address_name", ""),
-                "category": doc.get("category_name", ""),
-                "description": "반려견 동반 관련 키워드 검색 후보 (출입 가능 여부 미검증)",
-                "x": doc.get("x"), "y": doc.get("y"),
-                "detail_url": doc.get("place_url", ""),
-                "source": "카카오 로컬 API", "data_kind": "actual",
-                "pet_candidate": True,
-                "recommendation_reason": "반려견 동반 키워드로 검색된 후보입니다. 실제 동반 가능 여부와 이용 조건은 시설에 확인하세요.",
-            })
+        for category in (code, ""):
+            for doc in _kakao_pet_query(api_key, term, category, str(lon), str(lat)):
+                identity = doc.get("id") or (doc.get("place_name"), doc.get("address_name"))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                place = {
+                    "name": doc.get("place_name", ""),
+                    "address": doc.get("road_address_name") or doc.get("address_name", ""),
+                    "category": doc.get("category_name", ""),
+                    "description": "반려견 관련 키워드 검색 후보 · 출입 가능 여부 미확인",
+                    "x": doc.get("x"), "y": doc.get("y"),
+                    "detail_url": doc.get("place_url", ""),
+                    "source": "카카오 로컬 API", "data_kind": "actual",
+                    "pet_candidate": True,
+                    "pet_verified": False,
+                    "recommendation_reason": "반려견 관련 검색 후보입니다. 출입 허용 여부·실내/실외·견종 조건은 방문 전 확인하세요.",
+                }
+                if _pet_status(place) != "not_allowed":
+                    result.append(place)
     return result
 
 
-def _pet_filter(places: list[dict], strict: bool = True) -> list[dict]:
-    """명시적 출입 금지 제외. strict=True면 일반 후보 중 정보 불명도 제외."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def _kakao_pet_query(api_key: str, query: str, category_code: str,
+                     longitude: str, latitude: str) -> list[dict]:
+    """Search up to 20 km, without mandatory category when category-specific results are absent."""
+    if not api_key or not longitude or not latitude:
+        return []
+    params = {"query": query, "x": longitude, "y": latitude,
+              "radius": 20000, "sort": "distance", "size": 15}
+    if category_code:
+        params["category_group_code"] = category_code
+    try:
+        req = Request("https://dapi.kakao.com/v2/local/search/keyword.json?" + urlencode(params),
+                      headers={"Authorization": f"KakaoAK {api_key}"})
+        with urlopen(req, timeout=7) as response:
+            return json.load(response).get("documents", [])
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        return []
+
+
+def _pet_filter(places: list[dict], strict: bool = False) -> list[dict]:
+    """Never include explicitly disallowed places; keep unknowns as unverified fallback."""
     return [p for p in places if _pet_status(p) != "not_allowed" and
             (not strict or p.get("pet_candidate") or _pet_status(p) == "keyword_match")]
+
+
+def _pet_prioritize(places: list[dict]) -> list[dict]:
+    """Prefer pet-related candidates while retaining unverified general results."""
+    valid = _unique_places(_pet_filter(places))
+    return sorted(valid, key=lambda p: (
+        0 if p.get("pet_candidate") or _pet_status(p) == "keyword_match" else 1
+    ))
+
 
 
 def _extra_thematic_candidates(anchor: dict, destination: str, kind: str) -> list[dict]:
@@ -713,8 +753,8 @@ def build_location_itinerary(
             if pet_enabled:
                 regional_food = _pet_keyword_candidates(first, "food")
                 mood_cafes = _pet_keyword_candidates(last, "cafe")
-                food_candidates = _unique_places(_pet_filter(regional_food + restaurants))
-                cafe_candidates = _unique_places(_pet_filter(mood_cafes + cafes))
+                food_candidates = _pet_prioritize(regional_food + restaurants)
+                cafe_candidates = _pet_prioritize(mood_cafes + cafes)
             else:
                 regional_food = _extra_thematic_candidates(first, destination, "food")
                 mood_cafes = _extra_thematic_candidates(last, destination, "cafe")
@@ -1174,7 +1214,7 @@ def render_place_search_editor(itinerary: list, destination: str) -> None:
                     keyword.strip(), get_kakao_api_key(), category
                 )
             if st.session_state.get("search_result", {}).get("pet_enabled"):
-                places = _pet_filter(places)
+                places = _pet_prioritize(places)
             st.session_state.trip_edit_search_results = places
             st.session_state.trip_edit_search_category = category
             st.session_state.trip_edit_search_keyword = keyword.strip()
@@ -1187,7 +1227,7 @@ def render_place_search_editor(itinerary: list, destination: str) -> None:
             st.info("선택한 종류에 해당하는 검색 결과가 없습니다. 지역명이나 장소명을 바꿔 다시 검색해 주세요.")
         return
     if st.session_state.get("search_result", {}).get("pet_enabled"):
-        st.warning("반려견 동반 모드에서는 동반 관련 문구가 없는 일반 검색 결과를 제외합니다. 실제 출입 가능 여부는 시설에 직접 확인해 주세요.")
+        st.warning("반려견 관련 후보를 우선 표시합니다. 일반 검색 결과는 동반 여부가 미확인된 장소이므로 방문 전 시설에 확인해 주세요.")
     st.caption(
         f"{st.session_state.get('trip_edit_search_category', '관광지')}만 표시 · "
         f"검색 결과 {len(places)}곳 · 영업시간 및 실제 위치는 선택 전 확인해 주세요."
@@ -2076,8 +2116,7 @@ st.markdown(
 )
 
 # PC에서는 3열 × 2행 균등 배열, 모바일에서는 한 열로 표시합니다.
-# Streamlit 폼은 제출 전 선택 변경을 반영하지 않으므로 자녀 연령을 항상 표시하되
-# 가족 여행 유형일 때만 일정 추천에 적용합니다.
+# 자녀 동반 여부는 여행 동행 유형과 무관하게 독립적으로 선택합니다.
 with st.container():
     row1_destination, row1_party, row1_days = st.columns(3, gap="medium")
     with row1_destination:
@@ -2113,12 +2152,15 @@ with st.container():
         travel_style = (travel_style_primary if travel_style_secondary == "선택 안 함"
                         else travel_style_primary + " + " + travel_style_secondary)
     with row2_child:
-        family_party = party in ("우리 가족 여행", "3대 가족 여행")
+        child_enabled = st.checkbox(
+            "자녀 동반 여행", value=False, key="trip_child_enabled_v622",
+            help="동행 유형과 관계없이 자녀 인원과 연령을 일정 추천에 반영합니다.",
+        )
         child_count = st.number_input(
-            "자녀 수 (가족 여행만 적용)", min_value=0, max_value=10,
-            value=0, step=1, key="trip_child_count_v66",
-            disabled=not family_party,
-            help="0~10명까지 입력할 수 있습니다. 가족 여행 유형에만 반영됩니다.",
+            "자녀 수", min_value=1, max_value=10,
+            value=1, step=1, key="trip_child_count_v622",
+            disabled=not child_enabled,
+            help="자녀 동반을 선택하면 1~10명과 자녀별 연령을 설정할 수 있습니다.",
         )
 
     pet_enabled = st.checkbox(
@@ -2126,10 +2168,10 @@ with st.container():
         help="반려견 동반 관련 키워드로 관광지·음식점·카페를 검색합니다. 실제 출입 가능 여부는 장소에 직접 확인해야 합니다.",
     )
     if pet_enabled:
-        st.caption("반려견 동반 후보만 우선 표시합니다. 검색 결과에 동반 가능 표시가 있어도 실내·실외, 크기·견종, 케이지 조건은 방문 전 확인하세요.")
+        st.caption("반려견 관련 장소를 우선 추천합니다. 관련 정보가 없는 일반 장소는 '동반 여부 미확인'으로 취급하며, 실제 출입 가능 여부를 방문 전 확인해야 합니다.")
 
     child_ages = []
-    if family_party and int(child_count) > 0:
+    if child_enabled and int(child_count) > 0:
         st.markdown("**자녀별 연령 선택**")
         age_columns = st.columns(3, gap="medium")
         for idx in range(int(child_count)):
@@ -2347,8 +2389,8 @@ if search_result:
     selected_child_ages = search_result.get("child_ages", [])
     selected_pet = bool(search_result.get("pet_enabled", False))
     if selected_pet:
-        # 일반 TourAPI 결과에서 동반 가능 정보가 없는 장소는 안전하게 후보에서 제외합니다.
-        # 반려견 키워드로 찾은 관광지는 미검증 후보로 별도 표시합니다.
+        # 6-22: 반려견 관련 검색 후보를 우선하되, 정보가 없는 일반 관광지는
+        # '동반 여부 미확인' 상태로 유지해 검색 결과가 모두 사라지는 문제를 방지합니다.
         pet_tour_candidates = []
         anchor = next((a for a in actual_attractions if _valid_map_coordinates(a) is not None), None)
         if anchor is None:
@@ -2357,11 +2399,14 @@ if search_result:
                       "longitude": location.get("longitude") or location.get("x")}
         if _valid_map_coordinates(anchor) is not None:
             pet_tour_candidates = _pet_keyword_candidates(anchor, "tour")
-        actual_attractions = _unique_places(_pet_filter(actual_attractions) + _pet_filter(pet_tour_candidates))
-        actual_restaurants = _unique_places(_pet_filter(actual_restaurants))
+        actual_attractions = _pet_prioritize(pet_tour_candidates + actual_attractions)
         if _valid_map_coordinates(anchor) is not None:
-            actual_restaurants = _unique_places(actual_restaurants + _pet_filter(_pet_keyword_candidates(anchor, "food")))
-        st.info("반려견 동반 검색: 명시적으로 출입이 불가능한 장소와 동반 정보가 없는 일반 관광지·음식점은 자동 추천에서 제외했습니다. 키워드 검색 후보의 실제 출입 가능 여부는 확인되지 않았습니다.")
+            actual_restaurants = _pet_prioritize(
+                _pet_keyword_candidates(anchor, "food") + actual_restaurants
+            )
+        else:
+            actual_restaurants = _pet_prioritize(actual_restaurants)
+        st.info("반려견 동반 검색: 반려견 관련 키워드 후보를 우선하고 명시적 출입 금지 장소는 제외합니다. 관련 후보가 부족하면 동반 가능 여부가 확인되지 않은 일반 장소도 표시됩니다. 예약·방문 전 반드시 출입 가능 여부를 확인하세요.")
     ranked_attractions = rank_places_for_party(
         actual_attractions,
         selected_companion,
@@ -2378,6 +2423,10 @@ if search_result:
         selected_age,
         selected_party, selected_child_group, selected_child_ages,
     )
+
+    if selected_pet:
+        ranked_attractions = _pet_prioritize(ranked_attractions)
+        ranked_restaurants = _pet_prioritize(ranked_restaurants)
 
     st.subheader(f"{query} 여행 일정")
     # 6-12: 여행 조건을 취소선처럼 보이는 한 줄 caption 대신 구분된 정보 칩으로 표시합니다.
@@ -2481,7 +2530,7 @@ if search_result:
             )
     else:
         if selected_pet:
-            st.warning("반려견 동반 관련 관광지 후보를 찾지 못했습니다. 동반 여부가 확인되지 않은 일반 관광지는 자동으로 포함하지 않습니다. 지역을 바꾸거나 시설에 직접 확인해 주세요.")
+            st.warning("관광지 검색 결과가 없습니다. 반려견 동반 여부와 관계없이 현재 검색 지역의 관광지 데이터를 확인해 주세요.")
         else:
             st.info("실제 관광지 검색 결과가 없어 여행 코스를 생성하지 않았습니다.")
 
