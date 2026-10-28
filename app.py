@@ -440,6 +440,59 @@ def _kakao_thematic_query(api_key: str, query: str, category_code: str, longitud
     return [d for d in documents if d.get("category_group_code") == category_code]
 
 
+# 6-21: 반려견 관련 검색은 '가능성 있는 후보' 검색입니다.
+# 카카오 로컬 키워드 API에는 입장 가능 여부를 확정하는 구조화 필드가 없습니다.
+PET_POSITIVE = ("반려견 동반", "애견 동반", "반려동물 동반", "펫프렌들리", "강아지 동반", "반려견입장")
+PET_NEGATIVE = ("반려견 출입금지", "반려동물 출입금지", "애견 동반 불가", "반려견 동반 불가", "반려동물 동반 불가", "동물 출입 금지", "반려견 입장 불가")
+
+
+def _pet_status(place: dict) -> str:
+    text = " ".join(str(place.get(k) or "") for k in ("name", "category", "description", "pet_info", "pet_policy"))
+    normalized = " ".join(text.split())
+    if any(token in normalized for token in PET_NEGATIVE):
+        return "not_allowed"
+    if any(token in normalized for token in PET_POSITIVE):
+        return "keyword_match"
+    return "unknown"
+
+
+def _pet_keyword_candidates(anchor: dict, kind: str) -> list[dict]:
+    """Kakao 키워드 기반 후보. 키워드 검색 결과 자체는 동반 가능 인증이 아님."""
+    coords = _valid_map_coordinates(anchor)
+    if coords is None:
+        return []
+    lat, lon = coords
+    code = {"tour": "AT4", "food": "FD6", "cafe": "CE7"}[kind]
+    terms = {"tour": ("반려견 동반 관광지", "반려견 동반 공원", "애견 동반 여행지"),
+             "food": ("반려견 동반 식당", "애견 동반 음식점", "반려동물 동반 식당"),
+             "cafe": ("반려견 동반 카페", "애견 동반 카페")}[kind]
+    result, seen = [], set()
+    for term in terms:
+        for doc in _kakao_thematic_query(get_kakao_api_key(), term, code, str(lon), str(lat)):
+            identity = doc.get("id") or (doc.get("place_name"), doc.get("address_name"))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            result.append({
+                "name": doc.get("place_name", ""),
+                "address": doc.get("road_address_name") or doc.get("address_name", ""),
+                "category": doc.get("category_name", ""),
+                "description": "반려견 동반 관련 키워드 검색 후보 (출입 가능 여부 미검증)",
+                "x": doc.get("x"), "y": doc.get("y"),
+                "detail_url": doc.get("place_url", ""),
+                "source": "카카오 로컬 API", "data_kind": "actual",
+                "pet_candidate": True,
+                "recommendation_reason": "반려견 동반 키워드로 검색된 후보입니다. 실제 동반 가능 여부와 이용 조건은 시설에 확인하세요.",
+            })
+    return result
+
+
+def _pet_filter(places: list[dict], strict: bool = True) -> list[dict]:
+    """명시적 출입 금지 제외. strict=True면 일반 후보 중 정보 불명도 제외."""
+    return [p for p in places if _pet_status(p) != "not_allowed" and
+            (not strict or p.get("pet_candidate") or _pet_status(p) == "keyword_match")]
+
+
 def _extra_thematic_candidates(anchor: dict, destination: str, kind: str) -> list[dict]:
     coords = _valid_map_coordinates(anchor)
     if coords is None:
@@ -606,7 +659,8 @@ def _cluster_attraction_groups(groups: list[dict], count_per_day: int) -> list[d
 
 def build_location_itinerary(
     groups: list[dict], duration: str, travel_style: str, transport: str,
-    party: str = "혼자 여행", child_group: str | None = None, destination: str = ""
+    party: str = "혼자 여행", child_group: str | None = None, destination: str = "",
+    pet_enabled: bool = False,
 ) -> list[tuple[int, list[dict[str, str]]]]:
     days = duration_to_days(duration)
     plan = combined_style_plan(travel_style, party, child_group)
@@ -656,10 +710,16 @@ def build_location_itinerary(
             cafes = [p for g in day_groups for p in g.get("cafes", [])]
             first = attractions[0]
             last = attractions[-1]
-            regional_food = _extra_thematic_candidates(first, destination, "food")
-            mood_cafes = _extra_thematic_candidates(last, destination, "cafe")
-            food_candidates = _unique_places(regional_food + restaurants)
-            cafe_candidates = _unique_places(mood_cafes + cafes)
+            if pet_enabled:
+                regional_food = _pet_keyword_candidates(first, "food")
+                mood_cafes = _pet_keyword_candidates(last, "cafe")
+                food_candidates = _unique_places(_pet_filter(regional_food + restaurants))
+                cafe_candidates = _unique_places(_pet_filter(mood_cafes + cafes))
+            else:
+                regional_food = _extra_thematic_candidates(first, destination, "food")
+                mood_cafes = _extra_thematic_candidates(last, destination, "cafe")
+                food_candidates = _unique_places(regional_food + restaurants)
+                cafe_candidates = _unique_places(mood_cafes + cafes)
             # 자차/대중교통별 주변 후보 탐색 반경을 구분합니다.
             profile = _transport_profile(transport)
             nearby_food = [p for p in food_candidates if _place_distance(first, p) <= profile["food_radius"]]
@@ -678,6 +738,8 @@ def build_location_itinerary(
                 if place:
                     reason = ("지역 대표 음식 키워드가 확인된 후보입니다." if matched else
                               "지역 음식 후보가 부족해 동선상 가까운 음식점을 선택했습니다.")
+                    if pet_enabled:
+                        reason = "반려견 동반 관련 키워드 검색 후보입니다. 실제 출입 가능 여부·이용 조건을 직접 확인하세요."
                     add_activity(kind, place, reason + " 메뉴·영업시간은 확인이 필요합니다.")
                 return place
 
@@ -686,6 +748,8 @@ def build_location_itinerary(
                 if place:
                     reason = ("감성·전망·디저트 키워드가 확인된 카페 후보입니다." if matched else
                               "감성 키워드 후보가 부족해 동선상 가까운 카페를 선택했습니다.")
+                    if pet_enabled:
+                        reason = "반려견 동반 관련 키워드 검색 후보입니다. 실제 출입 가능 여부·이용 조건을 직접 확인하세요."
                     add_activity("카페·휴식", place, reason + " 실제 분위기·영업시간은 확인이 필요합니다.")
                 return place
 
@@ -1109,6 +1173,8 @@ def render_place_search_editor(itinerary: list, destination: str) -> None:
                 places, error = search_kakao_edit_places(
                     keyword.strip(), get_kakao_api_key(), category
                 )
+            if st.session_state.get("search_result", {}).get("pet_enabled"):
+                places = _pet_filter(places)
             st.session_state.trip_edit_search_results = places
             st.session_state.trip_edit_search_category = category
             st.session_state.trip_edit_search_keyword = keyword.strip()
@@ -1120,6 +1186,8 @@ def render_place_search_editor(itinerary: list, destination: str) -> None:
         if st.session_state.get("trip_edit_search_keyword") and not st.session_state.get("trip_edit_search_error"):
             st.info("선택한 종류에 해당하는 검색 결과가 없습니다. 지역명이나 장소명을 바꿔 다시 검색해 주세요.")
         return
+    if st.session_state.get("search_result", {}).get("pet_enabled"):
+        st.warning("반려견 동반 모드에서는 동반 관련 문구가 없는 일반 검색 결과를 제외합니다. 실제 출입 가능 여부는 시설에 직접 확인해 주세요.")
     st.caption(
         f"{st.session_state.get('trip_edit_search_category', '관광지')}만 표시 · "
         f"검색 결과 {len(places)}곳 · 영업시간 및 실제 위치는 선택 전 확인해 주세요."
@@ -1620,6 +1688,8 @@ def render_place_cards(places: list[Place], city: str, section: str) -> None:
                 st.markdown(f"**{place.get('name', '장소 정보 없음')}**")
                 st.caption(f"주소: {place.get('address') or '주소 정보가 제공되지 않았습니다.'}")
                 st.write(place.get("description") or "소개 정보가 제공되지 않았습니다.")
+                if place.get("pet_candidate"):
+                    st.caption("반려견 동반 키워드 검색 후보 · 실제 출입 가능 여부 미검증")
                 if place.get("phone"):
                     st.caption(f"전화번호: {place.get('phone')}")
                 with st.popover("상세보기"):
@@ -1915,14 +1985,6 @@ st.markdown(
         margin-bottom: 0.5rem;
     }
     .intro-copy { color: var(--muted); font-size: 1.05rem; }
-    .demo-note {
-        border-left: 4px solid var(--coral);
-        background: #fff3ee;
-        border-radius: 4px;
-        color: #66473f;
-        padding: 0.85rem 1rem;
-        margin: 1rem 0 1.5rem;
-    }
     .section-label {
         color: var(--accent);
         font-size: 0.76rem;
@@ -1976,7 +2038,6 @@ st.markdown(
         h2 { font-size: 1.35rem !important; }
         h3 { font-size: 1.15rem !important; }
         .intro-copy { font-size: 0.95rem; }
-        .demo-note { font-size: 0.8rem; padding: 0.65rem 0.75rem; }
         [data-testid="stForm"] { padding: 0.8rem 0.7rem; }
         [data-testid="stForm"] [data-testid="stHorizontalBlock"] {
             flex-direction: column !important;
@@ -2011,13 +2072,6 @@ st.markdown('<div class="brand-mark">✦ 국내 여행 검색</div>', unsafe_all
 st.title("TRIP FINDER")
 st.markdown(
     '<p class="intro-copy">가고 싶은 곳을 검색하고, 여행 아이디어를 한 화면에서 살펴보세요.</p>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<div class="demo-note"><strong>검색 정보 안내</strong> · API 연결 시 관광지와 주변 음식점은 '
-    '외부 검색 결과를 표시합니다. API 미설정·오류·결과 없음으로 예시 데이터를 표시할 때는 '
-    '별도 표기하며, 카드 추천은 방문 후기나 접근성 검증을 의미하지 않습니다. '
-    '블로그 게시일은 방문일이 아니며 YouTube 게시일은 촬영일을 의미하지 않습니다.</div>',
     unsafe_allow_html=True,
 )
 
@@ -2066,6 +2120,13 @@ with st.container():
             disabled=not family_party,
             help="0~10명까지 입력할 수 있습니다. 가족 여행 유형에만 반영됩니다.",
         )
+
+    pet_enabled = st.checkbox(
+        "반려견 동반 여행", value=False, key="trip_pet_enabled_v621",
+        help="반려견 동반 관련 키워드로 관광지·음식점·카페를 검색합니다. 실제 출입 가능 여부는 장소에 직접 확인해야 합니다.",
+    )
+    if pet_enabled:
+        st.caption("반려견 동반 후보만 우선 표시합니다. 검색 결과에 동반 가능 표시가 있어도 실내·실외, 크기·견종, 케이지 조건은 방문 전 확인하세요.")
 
     child_ages = []
     if family_party and int(child_count) > 0:
@@ -2138,6 +2199,7 @@ if submitted:
             "duration": duration,
             "transport": transport,
             "travel_style": travel_style,
+            "pet_enabled": pet_enabled,
             "child_age": child_age,
             "content_period": content_period,
             "video_order": video_order,
@@ -2283,6 +2345,23 @@ if search_result:
     selected_party = search_result.get("party", "우리 가족 여행")
     selected_child_group = search_result.get("child_group")
     selected_child_ages = search_result.get("child_ages", [])
+    selected_pet = bool(search_result.get("pet_enabled", False))
+    if selected_pet:
+        # 일반 TourAPI 결과에서 동반 가능 정보가 없는 장소는 안전하게 후보에서 제외합니다.
+        # 반려견 키워드로 찾은 관광지는 미검증 후보로 별도 표시합니다.
+        pet_tour_candidates = []
+        anchor = next((a for a in actual_attractions if _valid_map_coordinates(a) is not None), None)
+        if anchor is None:
+            location = st.session_state.get("destination_location", {})
+            anchor = {"latitude": location.get("latitude") or location.get("y"),
+                      "longitude": location.get("longitude") or location.get("x")}
+        if _valid_map_coordinates(anchor) is not None:
+            pet_tour_candidates = _pet_keyword_candidates(anchor, "tour")
+        actual_attractions = _unique_places(_pet_filter(actual_attractions) + _pet_filter(pet_tour_candidates))
+        actual_restaurants = _unique_places(_pet_filter(actual_restaurants))
+        if _valid_map_coordinates(anchor) is not None:
+            actual_restaurants = _unique_places(actual_restaurants + _pet_filter(_pet_keyword_candidates(anchor, "food")))
+        st.info("반려견 동반 검색: 명시적으로 출입이 불가능한 장소와 동반 정보가 없는 일반 관광지·음식점은 자동 추천에서 제외했습니다. 키워드 검색 후보의 실제 출입 가능 여부는 확인되지 않았습니다.")
     ranked_attractions = rank_places_for_party(
         actual_attractions,
         selected_companion,
@@ -2309,6 +2388,8 @@ if search_result:
         ("이동 수단", selected_transport),
         ("여행 스타일", selected_style),
     ]
+    if selected_pet:
+        trip_summary_items.append(("반려견", "동반 · 방문 전 시설 확인"))
     if selected_child_ages:
         trip_summary_items.append(("자녀", f"{len(selected_child_ages)}명 · {', '.join(selected_child_ages)}"))
     summary_chips = "".join(
@@ -2356,6 +2437,7 @@ if search_result:
                 selected_party,
                 selected_child_group,
                 query,
+                pet_enabled=selected_pet,
             )
             st.session_state.trip_original_itinerary = deepcopy(original_itinerary)
             st.session_state.trip_editable_itinerary = deepcopy(original_itinerary)
@@ -2398,12 +2480,16 @@ if search_result:
                 "직접 추가할 수 있습니다."
             )
     else:
-        st.info("실제 관광지 검색 결과가 없어 여행 코스를 생성하지 않았습니다.")
+        if selected_pet:
+            st.warning("반려견 동반 관련 관광지 후보를 찾지 못했습니다. 동반 여부가 확인되지 않은 일반 관광지는 자동으로 포함하지 않습니다. 지역을 바꾸거나 시설에 직접 확인해 주세요.")
+        else:
+            st.info("실제 관광지 검색 결과가 없어 여행 코스를 생성하지 않았습니다.")
 
     render_itinerary_map(location_itinerary)
     if location_itinerary:
         render_trip_exports(location_itinerary, query, selected_duration, "current")
         st.markdown("---")
+        st.caption("후기 게시일은 실제 방문일이 아니며, YouTube 게시일은 촬영일이 아닐 수 있습니다. 후기·영상은 방문 조건의 증빙이 아닙니다.")
         render_itinerary_place_media(
             location_itinerary, query, selected_companion,
             search_result.get("content_period", PERIOD_OPTIONS[0]),
@@ -2419,6 +2505,7 @@ if search_result:
                 "추천 순서는 TourAPI 관광지 유형·소개와 기존 동행자/스타일 점수를 이용합니다. "
                 "접근성·편의시설 정보는 추정하지 않습니다."
             )
+            st.caption("관광지 정보는 TourAPI·카카오 검색 결과입니다. 반려견 동반 여부, 접근성, 운영시간은 방문 전 시설에 확인하세요.")
             render_place_cards(ranked_attractions, query, "관광지")
         else:
             st.warning(tourism_response.get("message", "관광지 API 검색 결과가 없습니다."))
@@ -2433,6 +2520,7 @@ if search_result:
             st.caption(
                 "카카오 로컬 API가 제공한 주변 음식점입니다. 평점·방문자 리뷰·영업시간은 표시하거나 추정하지 않습니다."
             )
+            st.caption("음식점은 카카오 로컬 검색 결과입니다. 반려견 출입 가능 여부, 실내·실외 조건, 영업시간은 방문 전 확인하세요.")
             render_place_cards(ranked_restaurants, query, "주변 음식점")
         else:
             if restaurant_response.get("status") == "not_configured":
