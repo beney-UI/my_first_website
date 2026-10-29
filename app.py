@@ -1410,6 +1410,198 @@ def render_trip_replan(itinerary: list, transport: str) -> None:
         st.success(f"{selected_day}일 차에 승인된 재조정이 있습니다. 남은 일정 시작 기준 {_clock(applied['start_minute'])}")
 
 
+def _trip_627_api_key() -> str:
+    """Optional OpenAI key in Streamlit secrets; never expose it in the UI."""
+    try:
+        return str(st.secrets.get("OPENAI_API_KEY", "") or "").strip()
+    except (FileNotFoundError, KeyError, AttributeError):
+        return ""
+
+
+def _trip_627_ai_proposal(remaining: list[dict], transport: str, start_minute: int,
+                          end_minute: int, pace: str, anchor: dict | None,
+                          end_anchor: dict | None, user_request: str,
+                          allow_skip: bool, api_key: str) -> tuple[list[dict], list[dict], list[dict], int, int, str]:
+    """LLM may only reorder or omit eligible existing stop IDs; local engine owns timing."""
+    indexed = [{"id": i, "name": a.get("name", ""), "type": a.get("type", ""),
+                "manual_edit": bool(a.get("manual_edit"))}
+               for i, a in enumerate(remaining)]
+    payload = {
+        "model": "gpt-4.1-mini", "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": (
+                "You are a conservative travel itinerary editor. Output a JSON object with keys "
+                "order (array of unique integer IDs), omit (array of unique integer IDs), "
+                "reason (Korean, <=160 characters). Only use IDs in the input. "
+                "Never omit meal stops or manually added stops. "
+                "Do not claim verified traffic, weather, opening hours, pet access, or reservations. "
+                "Prefer keeping all stops unless time is short. No new places.")},
+            {"role": "user", "content": json.dumps({
+                "request": user_request[:500], "transport": transport,
+                "start": _clock(start_minute), "end_goal": _clock(end_minute),
+                "pace": pace, "allow_optional_omission": allow_skip,
+                "stops": indexed,
+            }, ensure_ascii=False)},
+        ],
+    }
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=25,
+        )
+        response.raise_for_status()
+        raw = response.json()["choices"][0]["message"]["content"]
+        result = json.loads(raw)
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("AI API 호출 또는 응답 처리에 실패했습니다. API 키, 사용량, 연결 상태를 확인하세요.") from exc
+    order, omit = result.get("order"), result.get("omit")
+    if not isinstance(order, list) or not isinstance(omit, list):
+        raise ValueError("AI가 올바른 일정 목록을 반환하지 않았습니다.")
+    valid_ids = set(range(len(remaining)))
+    if any(type(i) is not int for i in order + omit):
+        raise ValueError("AI 응답에 유효하지 않은 장소 번호가 포함됐습니다.")
+    if len(set(order)) != len(order) or len(set(omit)) != len(omit):
+        raise ValueError("AI 응답에 중복된 장소가 포함됐습니다.")
+    if set(order) & set(omit) or set(order) | set(omit) != valid_ids:
+        raise ValueError("AI 응답에서 장소가 누락되거나 추가됐습니다.")
+    if not allow_skip and omit:
+        raise ValueError("생략을 허용하지 않았는데 AI가 장소 생략을 제안했습니다.")
+    for i in omit:
+        a = remaining[i]
+        if a.get("type") not in ("관광", "카페·휴식") or a.get("manual_edit"):
+            raise ValueError("AI가 보호 대상인 식사 또는 직접 추가한 장소를 생략하려 했습니다.")
+    proposed = [deepcopy(remaining[i]) for i in order]
+    removed = [deepcopy(remaining[i]) for i in omit]
+    rows, finish, travel = _schedule_for_day(
+        proposed, transport, start_minute // 60, pace, anchor, end_anchor,
+        start_minute=start_minute,
+    )
+    return proposed, removed, rows, finish, travel, str(result.get("reason", ""))[:160]
+
+
+def render_trip_ai_recommendation(itinerary: list, transport: str) -> None:
+    """6-27: Optional OpenAI-powered reorder, with safe validation and explicit approval."""
+    st.markdown("#### AI 기반 남은 일정 재추천 · 6-27")
+    st.caption("현재 일정에 등록된 장소만 순서 변경하거나 선택적으로 생략합니다. "
+               "AI는 실제 교통·영업시간·날씨·반려견 출입을 검증하지 않으며, 승인 전에는 일정이 변경되지 않습니다.")
+    if not itinerary:
+        return
+    key = _trip_627_api_key()
+    if not key:
+        st.info("AI 추천을 사용하려면 Streamlit Cloud 앱 설정의 Secrets에 OPENAI_API_KEY를 등록하세요. "
+                "키가 없어도 위 6-26 규칙 기반 재조정 기능은 사용할 수 있습니다.")
+        return
+    day_options = [day for day, _ in itinerary]
+    c1, c2 = st.columns(2)
+    with c1:
+        selected_day = st.selectbox("AI 재추천 날짜", day_options,
+                                    format_func=lambda d: f"{d}일 차", key="trip_627_day")
+    with c2:
+        actual_time = st.time_input("재추천 시작 시각", value=datetime.now(ZoneInfo("Asia/Seoul")).time().replace(second=0, microsecond=0),
+                                    step=900, key="trip_627_start")
+    user_request = st.text_area("AI에 요청할 변경 사항 (선택)",
+                                placeholder="예: 아이가 피곤해서 관광지를 줄이고 식사는 유지해 줘",
+                                max_chars=500, key="trip_627_request")
+    allow_skip = st.checkbox("관광지·카페 생략 허용 (식사·직접 추가 장소 제외)",
+                             value=True, key="trip_627_allow_skip")
+    activities = next((a for d, a in itinerary if d == selected_day), [])
+    remaining, last_finished = _trip_626_day_remaining(selected_day, activities)
+    if not remaining:
+        st.info("남은 방문 장소가 없습니다. 방문 상태를 먼저 확인해 주세요.")
+        return
+    lodging = st.session_state.get("trip_623_selected_lodging")
+    first = selected_day == itinerary[0][0]
+    last = selected_day == itinerary[-1][0]
+    end_hour = int(st.session_state.get("trip_618_departure", 15)) if last else int(st.session_state.get("trip_617_end", 20))
+    pace = st.session_state.get("trip_617_pace", "보통")
+    start_minute = actual_time.hour * 60 + actual_time.minute
+    anchor = last_finished or (lodging if lodging and not first else None)
+    end_anchor = lodging if lodging and not last else None
+    import hashlib
+    signature = hashlib.sha256(json.dumps({
+        "day": selected_day, "time": start_minute, "request": user_request,
+        "skip": allow_skip, "places": [_place_identity(a) for a in remaining],
+        "transport": transport, "end": end_hour, "pace": pace,
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    if st.button("AI 일정 변경안 생성", key="trip_627_generate"):
+        try:
+            with st.spinner("현재 방문지를 기준으로 AI 변경안을 계산하는 중입니다..."):
+                proposed, removed, rows, finish, travel, reason = _trip_627_ai_proposal(
+                    remaining, transport, start_minute, end_hour * 60, pace,
+                    anchor, end_anchor, user_request, allow_skip, key,
+                )
+            st.session_state.trip_627_preview = {
+                "signature": signature, "day": selected_day, "proposed": proposed,
+                "removed": removed, "rows": rows, "finish": finish,
+                "travel": travel, "reason": reason, "start_minute": start_minute,
+                "anchor": anchor,
+            }
+        except (RuntimeError, ValueError) as exc:
+            st.session_state.trip_627_preview = None
+            st.error(str(exc))
+    preview = st.session_state.get("trip_627_preview")
+    if not preview or preview.get("signature") != signature:
+        return
+    st.write(f"**AI 제안: 남은 {len(remaining)}곳 → {len(preview['proposed'])}곳 · "
+             f"종료 예상 {_clock(preview['finish'])} · 이동 약 {preview['travel']}분**")
+    if preview["reason"]:
+        st.info("AI 제안 이유: " + preview["reason"])
+    if preview["removed"]:
+        st.warning("생략 제안: " + ", ".join(a.get("name", "") for a in preview["removed"]))
+    if preview["finish"] > end_hour * 60:
+        st.warning("목표 종료 시각을 초과합니다. AI 추천을 승인하기 전에 일정을 확인하세요.")
+    if first and lodging:
+        st.warning("첫날 체크인 중간 방문은 AI 재추천 시간표에 자동 반영되지 않습니다. 체크인 시간을 별도로 확인하세요.")
+    st.dataframe(preview["rows"], hide_index=True, use_container_width=True)
+    if st.button("AI 변경안 승인 및 일정 반영", type="primary", key="trip_627_approve"):
+        # Completed/canceled stops are kept as history; pending stops follow the AI order.
+        states = st.session_state.get("trip_624_visit_states", {})
+        history = []
+        for idx, activity in enumerate(activities):
+            if not is_editable_visit(activity) or states.get(
+                    _trip_626_visit_id(selected_day, idx, activity), "방문 예정") in ("방문 완료", "방문 취소"):
+                history.append(activity)
+        updated = deepcopy(itinerary)
+        for idx, (day, _) in enumerate(updated):
+            if day == selected_day:
+                updated[idx] = (day, deepcopy(history + preview["proposed"]))
+                break
+        # Preserve existing statuses by identity, including duplicates.
+        new_states = {}
+        for day, day_activities in updated:
+            old_activities = next((a for d, a in itinerary if d == day), [])
+            status_map = {}
+            for old_i, a in enumerate(old_activities):
+                identity = _place_identity(a) or a.get("name", "")
+                status_map.setdefault(identity, []).append(states.get(
+                    _trip_626_visit_id(day, old_i, a), "방문 예정"))
+            for new_i, a in enumerate(day_activities):
+                identity = _place_identity(a) or a.get("name", "")
+                values = status_map.get(identity, [])
+                if values:
+                    new_states[_trip_626_visit_id(day, new_i, a)] = values.pop(0)
+        st.session_state.trip_624_visit_states = new_states
+        st.session_state.trip_editable_itinerary = updated
+        st.session_state.trip_626_applied_plan = {
+            "day": selected_day, "start_minute": start_minute,
+            "anchor": anchor, "timestamp": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+        }
+        changes = st.session_state.setdefault("trip_627_change_history", [])
+        changes.append({"time": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                        "day": selected_day, "reason": preview["reason"],
+                        "removed": [a.get("name", "") for a in preview["removed"]],
+                        "remaining": len(preview["proposed"])})
+        st.session_state.trip_627_preview = None
+        st.session_state.trip_edit_last_change = f"6-27 AI 추천안 승인 · {selected_day}일 차"
+        st.rerun()
+    history = st.session_state.get("trip_627_change_history", [])
+    if history:
+        with st.expander("AI 변경 승인 이력", expanded=False):
+            st.dataframe(history[-15:], hide_index=True, use_container_width=True)
+
+
 def _alert_time_minutes(value: str) -> int | None:
     """Read the first HH:MM of an itinerary row, including en-dash ranges."""
     import re
@@ -3067,6 +3259,7 @@ if search_result:
         render_time_schedule(location_itinerary, selected_transport, query)
         render_trip_progress(location_itinerary)
         render_trip_replan(location_itinerary, selected_transport)
+        render_trip_ai_recommendation(location_itinerary, selected_transport)
         render_trip_alerts(location_itinerary, selected_transport)
         with st.expander("일정 추천 품질 점검", expanded=False):
             st.caption("방문 장소 중복·긴 직선 이동·식사 누락을 점검합니다. 실제 도로 경로, 영업시간, 리뷰 평점은 검증하지 않습니다.")
