@@ -697,10 +697,57 @@ def _cluster_attraction_groups(groups: list[dict], count_per_day: int) -> list[d
     return ordered
 
 
+def _lodging_aware_attractions(
+    attractions: list[dict], lodging: dict | None, transport: str, days: int, count: int
+) -> list[dict]:
+    """Select geographically cohesive day clusters around the chosen lodging.
+
+    Keeps the top-ranked candidates in consideration and only changes initial
+    automatic ordering; manually edited itineraries are never rewritten.
+    """
+    if not lodging or _valid_map_coordinates(lodging) is None or not attractions:
+        return _transport_order_attractions(attractions, transport, days, count)
+    remaining = list(attractions)
+    result = []
+    limit = max(1, days * count)
+    for day in range(days):
+        if not remaining or len(result) >= limit:
+            break
+        # Rank/nearby balance: search within the first few ranked candidates
+        # rather than choosing a low-quality attraction solely for proximity.
+        shortlist = remaining[:max(8, count * 4)]
+        if day == 0:
+            anchor = shortlist[0]  # First day preserves primary ranking.
+        else:
+            anchor = min(shortlist, key=lambda p: _place_distance(lodging, p))
+        remaining.remove(anchor)
+        cluster = [anchor]
+        for _ in range(count - 1):
+            if not remaining:
+                break
+            nearby = remaining[:max(12, count * 5)]
+            candidate = min(
+                nearby,
+                key=lambda p: (
+                    _place_distance(cluster[-1], p)
+                    + 0.3 * _place_distance(lodging, p),
+                    nearby.index(p),
+                ),
+            )
+            remaining.remove(candidate)
+            cluster.append(candidate)
+        # Middle days favor starting at the lodging-nearest attraction.
+        if day > 0 and len(cluster) > 1:
+            cluster = sorted(cluster, key=lambda p: _place_distance(lodging, p))
+        result.extend(cluster)
+    return result
+
+
 def build_location_itinerary(
     groups: list[dict], duration: str, travel_style: str, transport: str,
     party: str = "혼자 여행", child_group: str | None = None, destination: str = "",
     pet_enabled: bool = False,
+    lodging: dict | None = None,
 ) -> list[tuple[int, list[dict[str, str]]]]:
     days = duration_to_days(duration)
     plan = combined_style_plan(travel_style, party, child_group)
@@ -716,8 +763,8 @@ def build_location_itinerary(
             seen_attractions.add(identity)
         unique_groups.append(group)
     # 선택 이동수단에 맞춰 일자별 관광지 권역을 묶습니다.
-    ordered_attractions = _transport_order_attractions(
-        [g["attraction"] for g in unique_groups], transport, days, attractions_per_day
+    ordered_attractions = _lodging_aware_attractions(
+        [g["attraction"] for g in unique_groups], lodging, transport, days, attractions_per_day
     )
     group_lookup = {_place_identity(g["attraction"]): g for g in unique_groups}
     groups = [group_lookup[_place_identity(a)] for a in ordered_attractions if _place_identity(a) in group_lookup]
@@ -885,7 +932,8 @@ def _lodging_candidates(query: str, destination: str, api_key: str) -> list[dict
     return [
         {"name": d.get("place_name", ""),
          "address": d.get("road_address_name") or d.get("address_name", ""),
-         "latitude": str(d.get("y", "")), "longitude": str(d.get("x", ""))}
+         "latitude": str(d.get("y", "")), "longitude": str(d.get("x", "")),
+         "x": str(d.get("x", "")), "y": str(d.get("y", ""))}
         for d in docs if d.get("x") and d.get("y")
     ]
 
@@ -1065,7 +1113,7 @@ def render_integrity_audit(itinerary: list, transport: str) -> None:
 
 def render_time_schedule(itinerary: list, transport: str, destination: str = "") -> None:
     st.markdown("#### 예상 시간표 · 일정 현실성 점검")
-    st.caption("6-20: 첫날 도착·마지막 날 출발·숙소 이동을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
+    st.caption("6-23: 첫날 도착·마지막 날 출발·선택한 숙소의 이동을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
     a, b, c = st.columns(3)
     with a:
         start_hour = st.selectbox("중간 날짜 출발 시각", list(range(7, 13)), index=2,
@@ -1087,22 +1135,12 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
         departure = st.selectbox("마지막 날 귀가 출발 예정 시각", list(range(8, 24)), index=7,
                                  format_func=lambda h: f"{h:02d}:00", key="trip_618_departure")
 
-    lodging = None
+    lodging = st.session_state.get("trip_623_selected_lodging") if len(itinerary) > 1 else None
     if len(itinerary) > 1:
-        with st.expander("숙소 위치 설정 (선택)", expanded=False):
-            lodging_query = st.text_input("숙소 이름 또는 주소", key="trip_618_lodging_query",
-                                          placeholder="예: 제주 ○○호텔")
-            st.caption("숙소를 입력하면 카카오 장소 검색 결과에서 정확한 숙소를 선택할 수 있습니다. 예약이나 영업 여부는 확인하지 않습니다.")
-            if lodging_query.strip():
-                candidates = _lodging_candidates(lodging_query.strip(), destination, get_kakao_api_key())
-                if candidates:
-                    selected = st.selectbox("숙소 검색 결과", range(len(candidates)),
-                                            format_func=lambda i: f"{candidates[i]['name']} · {candidates[i]['address']}",
-                                            key="trip_618_lodging_selection")
-                    lodging = candidates[selected]
-                    st.success("숙소 위치를 중간 날짜 출발·복귀 이동시간에 반영합니다.")
-                else:
-                    st.warning("숙소를 찾지 못했습니다. 숙소 이동시간을 제외한 시간표를 표시합니다.")
+        if lodging:
+            st.info(f"숙소 기준 시간표: {lodging.get('name', '')} · {lodging.get('address', '')}")
+        else:
+            st.caption("숙소를 정했다면 상단 검색 조건에 숙소를 입력하고 여행지를 다시 검색해 주세요.")
     if not itinerary:
         return
     final_day = itinerary[-1][0]
@@ -1145,7 +1183,7 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
             st.caption("일정 편집 시 자동 재계산됩니다. 도로·버스 경로, 실시간 교통, 영업시간, 숙소 체크인 가능시간은 미확인입니다.")
     render_auto_adjustment(itinerary, transport, lodging, start_hour, end_hour, arrival, departure, pace)
     render_integrity_audit(itinerary, transport)
-    st.info("숙소는 이동시간 추정에 반영됩니다. 자동 조정은 미리보기 후 적용 버튼을 눌러야 실제 일정에 반영됩니다.")
+    st.info("숙소는 최초 추천 권역과 이동시간 추정에 반영됩니다. 자동 조정은 미리보기 후 적용 버튼을 눌러야 실제 일정에 반영됩니다.")
 
 
 EDITABLE_PLACE_TYPES = {"관광", "식사", "점심 식사", "저녁 식사", "카페·휴식"}
@@ -2170,6 +2208,18 @@ with st.container():
     if pet_enabled:
         st.caption("반려견 관련 장소를 우선 추천합니다. 관련 정보가 없는 일반 장소는 '동반 여부 미확인'으로 취급하며, 실제 출입 가능 여부를 방문 전 확인해야 합니다.")
 
+    # 6-23: 숙소를 여행 검색 전에 입력하면 최초 일정 생성 시 권역 선택에 반영합니다.
+    lodging_query_input = ""
+    if int(travel_days) > 1:
+        with st.expander("숙소를 정했다면 위치를 입력해 주세요 (선택)", expanded=True):
+            lodging_query_input = st.text_input(
+                "예약한 숙소 이름 또는 주소",
+                key="trip_623_lodging_query",
+                placeholder="예: 서귀포 ○○호텔 / 제주 애월읍 ○○펜션",
+                help="숙소 검색 결과에서 정확한 장소를 선택하고 일정을 생성합니다.",
+            )
+            st.caption("숙소 주변 권역을 우선 고려합니다. 실제 도로 경로·체크인 시간·예약 상태는 확인하지 않습니다.")
+
     child_ages = []
     if child_enabled and int(child_count) > 0:
         st.markdown("**자녀별 연령 선택**")
@@ -2242,6 +2292,7 @@ if submitted:
             "transport": transport,
             "travel_style": travel_style,
             "pet_enabled": pet_enabled,
+            "lodging_query": lodging_query_input.strip() if int(travel_days) > 1 else "",
             "child_age": child_age,
             "content_period": content_period,
             "video_order": video_order,
@@ -2455,6 +2506,30 @@ if search_result:
         unsafe_allow_html=True,
     )
 
+    # 6-23: 여행지 검색 이후 정확한 숙소를 선택합니다.
+    # 선택 결과는 세션에 저장하며, 변경 시 최초 자동 일정만 재생성합니다.
+    lodging_query = str(search_result.get("lodging_query") or "").strip()
+    selected_lodging = None
+    if duration_to_days(selected_duration) > 1 and lodging_query:
+        st.markdown("#### 숙소 위치 확인")
+        candidates = _lodging_candidates(lodging_query, query, get_kakao_api_key())
+        if candidates:
+            lodging_idx = st.selectbox(
+                "예약한 숙소를 선택해 주세요",
+                range(len(candidates)),
+                format_func=lambda i: f"{candidates[i]['name']} · {candidates[i]['address']}",
+                key=f"trip_623_lodging_choice_{st.session_state.get('trip_search_version', 0)}",
+            )
+            selected_lodging = candidates[lodging_idx]
+            st.caption("선택한 숙소를 기준으로 중간 날짜 관광지 권역과 예상 이동시간을 계산합니다.")
+        else:
+            st.warning("입력한 숙소를 찾지 못했습니다. 숙소를 제외한 일반 일정으로 구성합니다.")
+    lodging_identity = _place_identity(selected_lodging) if selected_lodging else ""
+    if st.session_state.get("trip_623_lodging_identity") != lodging_identity:
+        st.session_state.trip_623_lodging_identity = lodging_identity
+        st.session_state.trip_itinerary_version = None
+    st.session_state.trip_623_selected_lodging = selected_lodging
+
     location_itinerary = []
     if ranked_attractions:
         days = duration_to_days(selected_duration)
@@ -2487,6 +2562,7 @@ if search_result:
                 selected_child_group,
                 query,
                 pet_enabled=selected_pet,
+                lodging=selected_lodging,
             )
             st.session_state.trip_original_itinerary = deepcopy(original_itinerary)
             st.session_state.trip_editable_itinerary = deepcopy(original_itinerary)
