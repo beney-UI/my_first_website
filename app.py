@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 import json
 import requests
 from io import BytesIO
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
 
 import folium
@@ -942,9 +942,10 @@ def _lodging_candidates(query: str, destination: str, api_key: str) -> list[dict
 def _schedule_for_day(
     activities: list[dict], transport: str, start_hour: int, pace: str,
     start_anchor: dict | None = None, end_anchor: dict | None = None,
+    start_minute: int | None = None,
 ) -> tuple[list[dict], int, int]:
     visits = [a for a in activities if a.get("type") in ("관광", "식사", "점심 식사", "저녁 식사", "카페·휴식")]
-    current = start_hour * 60
+    current = start_minute if start_minute is not None else start_hour * 60
     rows = []
     travel_total = 0
     previous = start_anchor
@@ -1258,6 +1259,157 @@ def render_trip_progress(itinerary: list) -> None:
     st.caption("방문 취소는 상태만 변경하며 장소를 자동 삭제하거나 남은 일정을 재계산하지 않습니다. 자동 재조정은 다음 단계에서 연결합니다.")
 
 
+def _trip_626_visit_id(day: int, index: int, activity: dict) -> str:
+    return f"{day}:{_place_identity(activity) or activity.get('name', '')}:{index}"
+
+
+def _trip_626_day_remaining(day: int, activities: list) -> tuple[list, dict | None]:
+    """Do not reschedule finished/canceled stops. Last finished stop is the route anchor."""
+    states = st.session_state.get("trip_624_visit_states", {})
+    remaining, last_finished = [], None
+    for idx, activity in enumerate(activities):
+        if not is_editable_visit(activity):
+            continue
+        status = states.get(_trip_626_visit_id(day, idx, activity), "방문 예정")
+        if status == "방문 완료":
+            last_finished = activity
+        elif status != "방문 취소":
+            remaining.append(activity)
+    return remaining, last_finished
+
+
+def _trip_626_active_plan(day: int) -> dict | None:
+    plan = st.session_state.get("trip_626_applied_plan") or {}
+    return plan if plan.get("day") == day else None
+
+
+def _trip_626_preview(activities: list, transport: str, start_minute: int,
+                      end_minute: int, pace: str, anchor: dict | None,
+                      end_anchor: dict | None, allow_skip: bool) -> tuple[list, list, list, int, int]:
+    """Greedy conservative reduction: never remove meals or manually added places."""
+    candidate = deepcopy(activities)
+    removed = []
+    rows, finish, travel = _schedule_for_day(
+        candidate, transport, start_minute // 60, pace, anchor, end_anchor,
+        start_minute=start_minute,
+    )
+    if allow_skip:
+        while finish > end_minute:
+            eligible = [(i, a) for i, a in enumerate(candidate)
+                        if a.get("type") in ("관광", "카페·휴식") and not a.get("manual_edit")]
+            if not eligible:
+                break
+            alternatives = []
+            for i, a in eligible:
+                test = candidate[:i] + candidate[i+1:]
+                _, new_finish, _ = _schedule_for_day(
+                    test, transport, start_minute // 60, pace, anchor, end_anchor,
+                    start_minute=start_minute,
+                )
+                alternatives.append((new_finish, i, a))
+            best_finish, best_index, best_activity = min(alternatives, key=lambda x: x[0])
+            if best_finish >= finish:
+                break
+            removed.append(best_activity)
+            candidate.pop(best_index)
+            rows, finish, travel = _schedule_for_day(
+                candidate, transport, start_minute // 60, pace, anchor, end_anchor,
+                start_minute=start_minute,
+            )
+    return candidate, removed, rows, finish, travel
+
+
+def render_trip_replan(itinerary: list, transport: str) -> None:
+    """6-26: Manual delay/cancellation recovery with preview and explicit approval."""
+    st.markdown("#### 일정 지연·취소 시 재조정 · 6-26")
+    st.caption("실제 GPS·실시간 교통·운영시간을 확인하지 않습니다. 완료/취소 상태를 제외한 남은 장소만 재계산하며, 변경안은 승인 전까지 적용되지 않습니다.")
+    if not itinerary:
+        return
+    day_options = [day for day, _ in itinerary]
+    start_date = st.session_state.get("trip_625_start_date")
+    today_day = ((date.today() - start_date).days + 1) if isinstance(start_date, date) else 1
+    default_index = day_options.index(today_day) if today_day in day_options else 0
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        selected_day = st.selectbox("재조정할 날짜", day_options, index=default_index,
+                                    format_func=lambda d: f"{d}일 차", key="trip_626_day")
+    with c2:
+        actual_time = st.time_input("남은 일정 시작 시각", value=datetime.now(ZoneInfo("Asia/Seoul")).time().replace(second=0, microsecond=0),
+                                    step=900, key="trip_626_actual_time")
+    with c3:
+        skip_optional = st.checkbox("시간 초과 시 관광·카페 생략 제안", value=True, key="trip_626_skip")
+    activities = next((a for d, a in itinerary if d == selected_day), [])
+    remaining, last_finished = _trip_626_day_remaining(selected_day, activities)
+    if not remaining:
+        st.info("재조정할 방문 예정/방문 중 장소가 없습니다. 먼저 방문 진행 상태를 확인해 주세요.")
+        return
+    lodging = st.session_state.get("trip_623_selected_lodging")
+    first, last = selected_day == itinerary[0][0], selected_day == itinerary[-1][0]
+    end_hour = int(st.session_state.get("trip_618_departure", 15)) if last else int(st.session_state.get("trip_617_end", 20))
+    pace = st.session_state.get("trip_617_pace", "보통")
+    start_minute = actual_time.hour * 60 + actual_time.minute
+    anchor = last_finished or (lodging if lodging and not first else None)
+    end_anchor = lodging if lodging and not last else None
+    proposed, removed, rows, finish, travel = _trip_626_preview(
+        remaining, transport, start_minute, end_hour * 60, pace, anchor, end_anchor, skip_optional,
+    )
+    st.write(f"**남은 방문지 {len(remaining)}곳 → 제안 {len(proposed)}곳 · 예상 종료 {_clock(finish)} · 이동 약 {travel}분**")
+    if removed:
+        st.warning("생략 제안: " + ", ".join(a.get("name", "") for a in removed))
+    if finish > end_hour * 60:
+        st.warning(f"목표 종료 {end_hour:02d}:00보다 {finish-end_hour*60}분 초과합니다. 식사·직접 추가한 장소는 자동 제외하지 않습니다.")
+    if first and lodging:
+        st.warning("첫날 재조정 미리보기는 체크인 중간 방문을 자동 배치하지 않습니다. 체크인 시각과 이동 동선을 반드시 확인해 주세요.")
+    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.caption("방문 완료 장소는 이력으로 남고, 방문 취소 장소는 재조정 대상에서 제외됩니다. 숙소·이동시간은 추정입니다.")
+    if st.button("위 재조정안을 승인하고 적용", type="primary", key="trip_626_apply"):
+        # Apply only to selected day. Preserve original day indices and visit-state IDs
+        # for completed places; excluded optional stops are removed from active itinerary.
+        updated = deepcopy(itinerary)
+        remove_ids = {_place_identity(a) or a.get("name") for a in removed}
+        new_day = []
+        for idx, activity in enumerate(activities):
+            if not is_editable_visit(activity):
+                new_day.append(activity)
+                continue
+            status = st.session_state.get("trip_624_visit_states", {}).get(
+                _trip_626_visit_id(selected_day, idx, activity), "방문 예정")
+            if status in ("방문 완료", "방문 취소"):
+                new_day.append(activity)  # Retain history.
+            elif (_place_identity(activity) or activity.get("name")) not in remove_ids:
+                new_day.append(activity)
+        for i, (d, _) in enumerate(updated):
+            if d == selected_day:
+                updated[i] = (d, new_day)
+                break
+        # Re-key existing states when removing entries shifts list positions.
+        old_states = st.session_state.get("trip_624_visit_states", {})
+        new_states = {}
+        for d, new_activities in updated:
+            original_activities = next((a for old_d, a in itinerary if old_d == d), [])
+            original_keys = {}
+            for old_idx, a in enumerate(original_activities):
+                identity = _place_identity(a) or a.get("name", "")
+                original_keys.setdefault(identity, []).append(
+                    old_states.get(_trip_626_visit_id(d, old_idx, a), "방문 예정"))
+            for new_idx, a in enumerate(new_activities):
+                identity = _place_identity(a) or a.get("name", "")
+                prior = original_keys.get(identity, [])
+                if prior:
+                    new_states[_trip_626_visit_id(d, new_idx, a)] = prior.pop(0)
+        st.session_state.trip_624_visit_states = new_states
+        st.session_state.trip_editable_itinerary = updated
+        st.session_state.trip_626_applied_plan = {"day": selected_day,
+                                                  "start_minute": start_minute,
+                                                  "anchor": anchor,
+                                                  "timestamp": datetime.now(ZoneInfo("Asia/Seoul")).isoformat()}
+        st.session_state.trip_edit_last_change = f"6-26 {selected_day}일 차 재조정 승인 (남은 일정 {len(proposed)}곳)"
+        st.rerun()
+    applied = _trip_626_active_plan(selected_day)
+    if applied:
+        st.success(f"{selected_day}일 차에 승인된 재조정이 있습니다. 남은 일정 시작 기준 {_clock(applied['start_minute'])}")
+
+
 def _alert_time_minutes(value: str) -> int | None:
     """Read the first HH:MM of an itinerary row, including en-dash ranges."""
     import re
@@ -1279,11 +1431,21 @@ def _alert_schedule_rows(itinerary: list, transport: str, lodging: dict | None) 
     checkout = int(st.session_state.get("trip_624_checkout", 11))
     events = []
     for day, activities in itinerary:
-        rows, _, _ = _lodging_day_schedule(
-            activities, transport, arrival if day == itinerary[0][0] else start,
-            pace, lodging, day == itinerary[0][0], day == itinerary[-1][0],
-            checkin, checkout,
-        )
+        applied = _trip_626_active_plan(day)
+        if applied:
+            remaining, last_finished = _trip_626_day_remaining(day, activities)
+            rows, _, _ = _schedule_for_day(
+                remaining, transport, applied["start_minute"] // 60, pace,
+                start_anchor=last_finished or applied.get("anchor"),
+                end_anchor=lodging if lodging and day != itinerary[-1][0] else None,
+                start_minute=applied["start_minute"],
+            )
+        else:
+            rows, _, _ = _lodging_day_schedule(
+                activities, transport, arrival if day == itinerary[0][0] else start,
+                pace, lodging, day == itinerary[0][0], day == itinerary[-1][0],
+                checkin, checkout,
+            )
         for row in rows:
             kind = str(row.get("구분", ""))
             if kind not in ("이동 (추정)", "숙소 체크인", "숙소 체크아웃", "숙소 복귀", "관광", "점심 식사", "저녁 식사", "식사", "카페·휴식"):
@@ -1449,12 +1611,24 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
         # 마지막 날은 숙소에서 첫 관광지까지의 이동을 포함합니다.
         if lodging and is_last and checkout_hour >= day_end:
             st.warning(f"{day}일 차: 체크아웃 {checkout_hour:02d}:00이 귀가 출발 {day_end:02d}:00보다 늦거나 같습니다. 시간을 조정해 주세요.")
-        rows, finish, travel = _lodging_day_schedule(
-            activities, transport, day_start, pace, lodging, is_first, is_last,
-            checkin_hour, checkout_hour
-        )
+        applied = _trip_626_active_plan(day)
+        if applied:
+            remaining, last_finished = _trip_626_day_remaining(day, activities)
+            rows, finish, travel = _schedule_for_day(
+                remaining, transport, applied["start_minute"] // 60, pace,
+                start_anchor=last_finished or applied.get("anchor"),
+                end_anchor=lodging if lodging and not is_last else None,
+                start_minute=applied["start_minute"],
+            )
+        else:
+            rows, finish, travel = _lodging_day_schedule(
+                activities, transport, day_start, pace, lodging, is_first, is_last,
+                checkin_hour, checkout_hour
+            )
         title = f"{day}일 차 · 예상 종료 {_clock(finish)} · 이동 약 {travel}분"
         with st.expander(title, expanded=is_first):
+            if applied:
+                st.info(f"6-26 재조정 적용: {_clock(applied['start_minute'])}부터 남은 방문지만 계산합니다. 완료·취소 장소는 시간표에서 제외됩니다.")
             if is_first:
                 st.caption(f"첫날 여행지 도착 {day_start:02d}:00부터 시작합니다.")
                 if lodging:
@@ -2866,6 +3040,7 @@ if search_result:
             st.session_state.trip_original_itinerary = deepcopy(original_itinerary)
             st.session_state.trip_editable_itinerary = deepcopy(original_itinerary)
             st.session_state.trip_624_visit_states = {}
+            st.session_state.trip_626_applied_plan = None
             st.session_state.trip_nearby_message = nearby_response.get("message", "")
             st.session_state.trip_itinerary_version = itinerary_key
 
@@ -2891,6 +3066,7 @@ if search_result:
         render_editable_itinerary(location_itinerary)
         render_time_schedule(location_itinerary, selected_transport, query)
         render_trip_progress(location_itinerary)
+        render_trip_replan(location_itinerary, selected_transport)
         render_trip_alerts(location_itinerary, selected_transport)
         with st.expander("일정 추천 품질 점검", expanded=False):
             st.caption("방문 장소 중복·긴 직선 이동·식사 누락을 점검합니다. 실제 도로 경로, 영업시간, 리뷰 평점은 검증하지 않습니다.")
