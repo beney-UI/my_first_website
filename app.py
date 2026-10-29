@@ -1111,30 +1111,107 @@ def render_integrity_audit(itinerary: list, transport: str) -> None:
         st.caption("이 점검은 일정 데이터를 변경하지 않습니다. 지도 표시·API 응답·실제 교통시간·영업 여부를 검증하는 것은 아닙니다.")
 
 
+def _first_day_with_scheduled_checkin(
+    activities: list, transport: str, day_start: int, pace: str,
+    lodging: dict, checkin_hour: int, checkin_minutes: int = 20,
+) -> tuple[list[dict], int, int]:
+    """Insert a hotel stop at the chosen check-in time and resume remaining visits.
+
+    Never split a visit in half. If the requested time is impossible because of
+    the arrival time or a preceding visit, show the real projected time and warn.
+    """
+    visits = [a for a in activities if a.get("type") in
+              ("관광", "식사", "점심 식사", "저녁 식사", "카페·휴식")]
+    target = checkin_hour * 60
+    start = day_start * 60
+    # Choose a visit boundary where we can arrive by check-in, preferring
+    # the latest feasible arrival. If none, check in before any visits.
+    chosen = 0
+    latest = -1
+    for split in range(len(visits) + 1):
+        before = visits[:split]
+        if before:
+            _, finish, _ = _schedule_for_day(before, transport, day_start, pace,
+                                             end_anchor=lodging)
+        else:
+            # First-day origin is not specified: use arrival time as earliest
+            # possible hotel arrival, without inventing an origin-to-hotel route.
+            finish = start
+        if finish <= target and finish >= latest:
+            latest, chosen = finish, split
+
+    before = visits[:chosen]
+    after = visits[chosen:]
+    if before:
+        rows, arrived, travel = _schedule_for_day(before, transport, day_start, pace,
+                                                  end_anchor=lodging)
+    else:
+        rows, arrived, travel = [], start, 0
+    if arrived < target:
+        rows.append({"시간": f"{_clock(arrived)}–{_clock(target)}",
+                     "구분": "체크인 전 대기/휴식", "장소/활동": lodging.get("name", "숙소"),
+                     "소요": f"약 {target-arrived}분", "비고": "체크인 예정 시각 대기"})
+    actual_start = max(arrived, target)
+    if arrived > target:
+        rows.append({"시간": _clock(arrived), "구분": "체크인 시간 지연",
+                     "장소/활동": lodging.get("name", "숙소"), "소요": "안내",
+                     "비고": f"선택 시각 {_clock(target)}보다 {arrived-target}분 늦음"})
+    rows.append({"시간": f"{_clock(actual_start)}–{_clock(actual_start + checkin_minutes)}",
+                 "구분": "숙소 체크인", "장소/활동": lodging.get("name", "숙소"),
+                 "소요": f"약 {checkin_minutes}분", "비고": "체크인·짐 정리 가정"})
+    resume = actual_start + checkin_minutes
+    if after:
+        # _schedule_for_day accepts whole-hour start only; create the remaining
+        # minute-accurate rows by calculating at hour zero and shifting times.
+        previous = lodging
+        for activity in after:
+            transfer, basis = _estimated_transfer_minutes(previous, activity, transport)
+            rows.append({"시간": f"{_clock(resume)}–{_clock(resume+transfer)}",
+                         "구분": "이동 (추정)",
+                         "장소/활동": f"{previous.get('name','')} → {activity.get('name','')}",
+                         "소요": f"약 {transfer}분", "비고": basis})
+            resume += transfer
+            travel += transfer
+            stay = _visit_minutes(activity, pace)
+            rows.append({"시간": f"{_clock(resume)}–{_clock(resume+stay)}",
+                         "구분": activity.get("type", "방문"),
+                         "장소/활동": activity.get("name", ""),
+                         "소요": f"약 {stay}분", "비고": "체류시간 가정"})
+            resume += stay
+            previous = activity
+        transfer, basis = _estimated_transfer_minutes(previous, lodging, transport)
+        rows.append({"시간": f"{_clock(resume)}–{_clock(resume+transfer)}",
+                     "구분": "이동 (추정)",
+                     "장소/활동": f"{previous.get('name','')} → {lodging.get('name','')}",
+                     "소요": f"약 {transfer}분", "비고": basis})
+        resume += transfer
+        travel += transfer
+        rows.append({"시간": _clock(resume), "구분": "숙소 복귀",
+                     "장소/활동": lodging.get("name", "숙소"), "소요": "도착",
+                     "비고": "체크인 후 남은 관광 완료"})
+    return rows, resume, travel
+
+
 def _lodging_day_schedule(activities: list, transport: str, day_start: int, pace: str,
                           lodging: dict | None, is_first: bool, is_last: bool,
                           checkin_hour: int, checkout_hour: int) -> tuple[list[dict], int, int]:
-    """Include lodging check-in/out as actual schedule rows, not just annotations."""
-    if not lodging:
-        return _schedule_for_day(activities, transport, day_start, pace)
-    if is_first and is_last:
+    """Include hotel check-in as an intermediate stop on the first day."""
+    if not lodging or (is_first and is_last):
         return _schedule_for_day(activities, transport, day_start, pace)
     if is_last:
         rows = [{"시간": f"{checkout_hour:02d}:00", "구분": "숙소 체크아웃",
-                 "장소/활동": lodging.get("name", "숙소"), "소요": "기준 시각", "비고": "예약 숙소 규정 확인"}]
-        visits, finish, travel = _schedule_for_day(activities, transport, checkout_hour, pace,
-                                                   start_anchor=lodging)
+                 "장소/활동": lodging.get("name", "숙소"), "소요": "기준 시각",
+                 "비고": "예약 숙소 규정 확인"}]
+        visits, finish, travel = _schedule_for_day(activities, transport, checkout_hour,
+                                                   pace, start_anchor=lodging)
         return rows + visits, finish, travel
+    if is_first:
+        return _first_day_with_scheduled_checkin(activities, transport, day_start,
+                                                 pace, lodging, checkin_hour)
     rows, finish, travel = _schedule_for_day(activities, transport, day_start, pace,
-                                            end_anchor=lodging)
-    checkin_at = checkin_hour * 60
-    if is_first and finish < checkin_at:
-        rows.append({"시간": f"{_clock(finish)}–{_clock(checkin_at)}", "구분": "체크인 대기/휴식",
-                     "장소/활동": lodging.get("name", "숙소"),
-                     "소요": f"약 {checkin_at-finish}분", "비고": "체크인 가능시각 이전 도착"})
-        finish = checkin_at
-    rows.append({"시간": _clock(finish), "구분": "숙소 체크인" if is_first else "숙소 복귀",
-                 "장소/활동": lodging.get("name", "숙소"), "소요": "기준 시각", "비고": "예약 숙소 규정 확인" if is_first else ""})
+                                            start_anchor=lodging, end_anchor=lodging)
+    rows.append({"시간": _clock(finish), "구분": "숙소 복귀",
+                 "장소/활동": lodging.get("name", "숙소"), "소요": "도착", "비고": ""})
     return rows, finish, travel
 
 
@@ -1182,7 +1259,7 @@ def render_trip_progress(itinerary: list) -> None:
 
 def render_time_schedule(itinerary: list, transport: str, destination: str = "") -> None:
     st.markdown("#### 예상 시간표 · 일정 현실성 점검")
-    st.caption("6-24: 첫날 도착·마지막 날 출발·숙소 체크인·체크아웃을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
+    st.caption("6-24 개선: 첫날 선택한 시각에 숙소 체크인 후 관광 재개·마지막 날 체크아웃을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
     a, b, c = st.columns(3)
     with a:
         start_hour = st.selectbox("중간 날짜 출발 시각", list(range(7, 13)), index=2,
@@ -1210,12 +1287,12 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
         st.markdown("##### 숙소 체크인·체크아웃")
         in_col, out_col = st.columns(2)
         with in_col:
-            checkin_hour = st.selectbox("체크인 가능 시각", list(range(12, 23)), index=3,
+            checkin_hour = st.selectbox("첫날 체크인 예정 시각", list(range(12, 23)), index=3,
                                          format_func=lambda h: f"{h:02d}:00", key="trip_624_checkin")
         with out_col:
             checkout_hour = st.selectbox("체크아웃 시각", list(range(7, 16)), index=4,
                                           format_func=lambda h: f"{h:02d}:00", key="trip_624_checkout")
-        st.caption("기본값: 체크인 15:00 · 체크아웃 11:00. 실제 숙소 예약 안내에 맞게 변경하세요.")
+        st.caption("체크인 기본 15:00 · 체크아웃 기본 11:00. 선택한 시각에 숙소에 들러 체크인(약 20분) 후 남은 관광을 계속합니다. 실제 숙소 규정을 확인하세요.")
     if len(itinerary) > 1:
         if lodging:
             st.info(f"숙소 기준 시간표: {lodging.get('name', '')} · {lodging.get('address', '')}")
@@ -1244,6 +1321,10 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
         with st.expander(title, expanded=is_first):
             if is_first:
                 st.caption(f"첫날 여행지 도착 {day_start:02d}:00부터 시작합니다.")
+                if lodging:
+                    st.caption(f"체크인 {checkin_hour:02d}:00 → 짐 정리 약 20분 → 남은 일정 진행 → 숙소 복귀")
+                    if day_start > checkin_hour:
+                        st.warning("첫날 도착 예정 시각이 체크인 희망 시각보다 늦습니다. 체크인은 도착 이후로 표시됩니다.")
             if is_last:
                 st.caption(f"마지막 날 귀가 출발 {day_end:02d}:00 전 일정 종료를 목표로 합니다.")
             if not rows:
