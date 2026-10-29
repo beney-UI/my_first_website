@@ -1124,7 +1124,7 @@ def _first_day_with_scheduled_checkin(
     """
     visits = [a for a in activities if a.get("type") in
               ("관광", "식사", "점심 식사", "저녁 식사", "카페·휴식")]
-    target = checkin_hour * 60
+    target = round(checkin_hour * 60)
     start = day_start * 60
     # Choose a visit boundary where we can arrive by check-in, preferring
     # the latest feasible arrival. If none, check in before any visits.
@@ -1225,7 +1225,7 @@ def _trip_628_dashboard_rows(itinerary: list, transport: str) -> list[dict]:
     pace = st.session_state.get("trip_617_pace", "보통")
     start = int(st.session_state.get("trip_617_start", 9))
     arrival = int(st.session_state.get("trip_618_arrival", 13))
-    checkin = int(st.session_state.get("trip_624_checkin", 15))
+    checkin = float(st.session_state.get("trip_624_checkin", 15))
     checkout = int(st.session_state.get("trip_624_checkout", 11))
     output = []
     for day, activities in itinerary:
@@ -1286,7 +1286,7 @@ def render_trip_dashboard(itinerary: list, transport: str, destination: str, dur
         st.progress(done / total)
     lodging = st.session_state.get("trip_623_selected_lodging")
     if lodging:
-        st.info(f"숙소: {lodging.get('name', '숙소')} · 체크인 {int(st.session_state.get('trip_624_checkin', 15)):02d}:00 · 체크아웃 {int(st.session_state.get('trip_624_checkout', 11)):02d}:00")
+        st.info(f"숙소: {lodging.get('name', '숙소')} · 체크인 {_clock(round(float(st.session_state.get('trip_624_checkin', 15))*60))} · 체크아웃 {int(st.session_state.get('trip_624_checkout', 11)):02d}:00")
     start_date = st.session_state.get("trip_625_start_date")
     if isinstance(start_date, date):
         st.caption(f"여행 시작일: {start_date.isoformat()} · 여행지: {destination} · 기간: {duration}")
@@ -1529,7 +1529,7 @@ def _alert_schedule_rows(itinerary: list, transport: str, lodging: dict | None) 
     start = int(st.session_state.get("trip_617_start", 9))
     pace = st.session_state.get("trip_617_pace", "보통")
     arrival = int(st.session_state.get("trip_618_arrival", 13))
-    checkin = int(st.session_state.get("trip_624_checkin", 15))
+    checkin = float(st.session_state.get("trip_624_checkin", 15))
     checkout = int(st.session_state.get("trip_624_checkout", 11))
     events = []
     for day, activities in itinerary:
@@ -1660,39 +1660,35 @@ def render_trip_alerts(itinerary: list, transport: str) -> None:
 def render_time_schedule(itinerary: list, transport: str, destination: str = "") -> None:
     st.markdown("#### 예상 시간표 · 일정 현실성 점검")
     st.caption("6-24 개선: 첫날 선택한 시각에 숙소 체크인 후 관광 재개·마지막 날 체크아웃을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
-    a, b, c = st.columns(3)
-    with a:
-        start_hour = st.selectbox("중간 날짜 출발 시각", list(range(7, 13)), index=2,
-                                  format_func=lambda h: f"{h:02d}:00", key="trip_617_start")
-    with b:
-        end_hour = st.selectbox("중간 날짜 종료 희망 시각", list(range(16, 24)), index=4,
-                                format_func=lambda h: f"{h:02d}:00", key="trip_617_end")
-    with c:
-        pace = st.selectbox("여행 속도", ["여유롭게", "보통", "빠르게"], index=1, key="trip_617_pace")
+    start_hour = int(st.session_state.get("trip_617_start", 9))
+    end_hour = int(st.session_state.get("trip_617_end", 20))
+    pace = st.session_state.get("trip_617_pace", "보통")
+    arrival = int(st.session_state.get("trip_618_arrival", 13))
+    departure = int(st.session_state.get("trip_618_departure", 15))
+    st.caption(f"검색 시 선택한 시간 조건: 첫날 {arrival:02d}:00 도착 · 마지막 날 {departure:02d}:00 출발 · 중간 날짜 {start_hour:02d}:00~{end_hour:02d}:00 · {pace}")
     if start_hour >= end_hour:
-        st.warning("중간 날짜의 종료 시각을 시작 시각보다 늦게 선택해 주세요.")
+        st.warning("중간 날짜 종료 희망시각이 출발시각보다 늦어야 합니다. 상단 여행 검색 조건을 변경해 주세요.")
         return
 
-    first_col, last_col = st.columns(2)
-    with first_col:
-        arrival = st.selectbox("첫날 여행지 도착 예정 시각", list(range(7, 23)), index=6,
-                               format_func=lambda h: f"{h:02d}:00", key="trip_618_arrival")
-    with last_col:
-        departure = st.selectbox("마지막 날 귀가 출발 예정 시각", list(range(8, 24)), index=7,
-                                 format_func=lambda h: f"{h:02d}:00", key="trip_618_departure")
-
     lodging = st.session_state.get("trip_623_selected_lodging") if len(itinerary) > 1 else None
-    checkin_hour, checkout_hour = 15, 11
+    checkin_hour = float(st.session_state.get("trip_624_checkin", 15))
+    checkout_hour = int(st.session_state.get("trip_624_checkout", 11))
     if lodging:
-        st.markdown("##### 숙소 체크인·체크아웃")
-        in_col, out_col = st.columns(2)
-        with in_col:
-            checkin_hour = st.selectbox("첫날 체크인 예정 시각", list(range(12, 23)), index=3,
-                                         format_func=lambda h: f"{h:02d}:00", key="trip_624_checkin")
-        with out_col:
-            checkout_hour = st.selectbox("체크아웃 시각", list(range(7, 16)), index=4,
-                                          format_func=lambda h: f"{h:02d}:00", key="trip_624_checkout")
-        st.caption("체크인 기본 15:00 · 체크아웃 기본 11:00. 선택한 시각에 숙소에 들러 체크인(약 20분) 후 남은 관광을 계속합니다. 실제 숙소 규정을 확인하세요.")
+        st.markdown("##### 실제 숙소 체크인 시간 반영")
+        actual_checkin = st.checkbox(
+            "실제 체크인 시간을 입력해 일정에 반영", key="trip_630_actual_checkin_enabled",
+            help="체크인한 시간을 입력하면 첫날 숙소 방문 및 이후 관광 일정을 다시 계산합니다.",
+        )
+        if actual_checkin:
+            previous = st.session_state.get("trip_630_actual_checkin_time", time(15, 0))
+            actual_time = st.time_input("실제 체크인 시각", value=previous,
+                                        step=timedelta(minutes=5), key="trip_630_actual_checkin_time")
+            checkin_hour = actual_time.hour + actual_time.minute / 60
+        else:
+            checkin_hour = 15.0
+        st.session_state["trip_624_checkin"] = checkin_hour
+        st.session_state["trip_624_checkout"] = 11
+        st.caption(f"적용 체크인 {_clock(round(checkin_hour*60))} · 체크아웃 11:00 (기본값). 체크인 후 약 20분 짐 정리 후 남은 관광을 진행합니다.")
     if len(itinerary) > 1:
         if lodging:
             st.info(f"숙소 기준 시간표: {lodging.get('name', '')} · {lodging.get('address', '')}")
@@ -1734,7 +1730,7 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
             if is_first:
                 st.caption(f"첫날 여행지 도착 {day_start:02d}:00부터 시작합니다.")
                 if lodging:
-                    st.caption(f"체크인 {checkin_hour:02d}:00 → 짐 정리 약 20분 → 남은 일정 진행 → 숙소 복귀")
+                    st.caption(f"체크인 {_clock(round(checkin_hour*60))} → 짐 정리 약 20분 → 남은 일정 진행 → 숙소 복귀")
                     if day_start > checkin_hour:
                         st.warning("첫날 도착 예정 시각이 체크인 희망 시각보다 늦습니다. 체크인은 도착 이후로 표시됩니다.")
             if is_last:
@@ -2781,6 +2777,7 @@ with st.container():
         )
         duration = days_to_duration(int(travel_days))
 
+    # 6-30: 여행 시간 조건은 여행지 검색 전에 한 번만 설정합니다.
     row2_transport, row2_style, row2_child = st.columns(3, gap="medium")
     with row2_transport:
         transport = st.selectbox("이동 수단", TRANSPORT_MODES)
@@ -2812,6 +2809,29 @@ with st.container():
     )
     if pet_enabled:
         st.caption("반려견 관련 장소를 우선 추천합니다. 관련 정보가 없는 일반 장소는 '동반 여부 미확인'으로 취급하며, 실제 출입 가능 여부를 방문 전 확인해야 합니다.")
+
+    st.markdown("#### 여행 일정 시간 조건")
+    timing1, timing2, timing3 = st.columns(3, gap="medium")
+    with timing1:
+        st.selectbox("여행 속도", ["여유롭게", "보통", "빠르게"],
+                     index=1, key="trip_617_pace")
+    with timing2:
+        st.selectbox("첫날 여행지 도착 예정 시각", list(range(7, 23)),
+                     index=6, format_func=lambda h: f"{h:02d}:00", key="trip_618_arrival")
+    with timing3:
+        st.selectbox("마지막 날 귀가 출발 예정 시각", list(range(8, 24)),
+                     index=7, format_func=lambda h: f"{h:02d}:00", key="trip_618_departure")
+    timing4, timing5 = st.columns(2, gap="medium")
+    with timing4:
+        st.selectbox("중간 날짜 출발 시각", list(range(7, 13)),
+                     index=2, format_func=lambda h: f"{h:02d}:00", key="trip_617_start")
+    with timing5:
+        st.selectbox("중간 날짜 종료 희망 시각", list(range(16, 24)),
+                     index=4, format_func=lambda h: f"{h:02d}:00", key="trip_617_end")
+    # 호텔 규정은 숙소마다 다르므로 기본 시각만 제시합니다.
+    st.session_state.setdefault("trip_624_checkin", 15.0)
+    st.session_state.setdefault("trip_624_checkout", 11)
+    st.caption("숙소 체크인 기본 15:00 · 체크아웃 기본 11:00. 실제 체크인한 시간은 검색 후 여행 일정 관리에서 입력할 수 있습니다.")
 
     # 6-23: 숙소를 여행 검색 전에 입력하면 최초 일정 생성 시 권역 선택에 반영합니다.
     lodging_query_input = ""
@@ -3192,6 +3212,12 @@ if search_result:
         # 6-29 화면 순서: 통합 대시보드 → 여행 동선 지도 → 여행 일정 관리.
         # 장소 편집은 대시보드 오른쪽 상단의 편집 버튼으로 전용 화면에서 수행합니다.
         location_itinerary = st.session_state.trip_editable_itinerary
+        # Dashboard is rendered first; align its check-in display with actual-time input.
+        if st.session_state.get("trip_630_actual_checkin_enabled"):
+            actual = st.session_state.get("trip_630_actual_checkin_time", time(15, 0))
+            st.session_state["trip_624_checkin"] = actual.hour + actual.minute / 60
+        else:
+            st.session_state["trip_624_checkin"] = 15.0
         render_trip_dashboard(location_itinerary, selected_transport, query, selected_duration)
         render_itinerary_map(location_itinerary)
         st.markdown("---")
