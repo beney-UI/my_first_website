@@ -1259,7 +1259,14 @@ def _trip_628_dashboard_rows(itinerary: list, transport: str) -> list[dict]:
 def render_trip_dashboard(itinerary: list, transport: str, destination: str, duration: str) -> None:
     """6-28: Free, session-local dashboard synchronized to the current itinerary."""
     st.markdown("---")
-    st.subheader("여행 일정 통합 대시보드 · 6-28")
+    dashboard_title, dashboard_edit = st.columns([5, 1], vertical_alignment="center")
+    with dashboard_title:
+        st.subheader("여행 일정 통합 대시보드 · 6-28")
+    with dashboard_edit:
+        if st.button("✏️ 편집", key="trip_629_dashboard_edit", use_container_width=True,
+                     help="일정 편집 전용 화면으로 이동합니다."):
+            st.session_state.trip_629_edit_page = True
+            st.rerun()
     st.caption("현재 편집한 일정과 승인된 6-26 재조정안을 기준으로 표시합니다. 유료 AI API는 사용하지 않습니다.")
     if not itinerary:
         st.info("대시보드에 표시할 일정이 없습니다.")
@@ -2714,6 +2721,36 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# 6-29: 대시보드 편집 버튼을 누르면 검색/지도/시간표를 숨긴 전용 편집 화면을 표시합니다.
+# 별도 URL이 아닌 Streamlit 세션 기반 화면 전환이며 기존 일정 데이터는 그대로 유지합니다.
+if st.session_state.get("trip_629_edit_page", False):
+    editable = st.session_state.get("trip_editable_itinerary")
+    if not editable:
+        st.session_state.trip_629_edit_page = False
+        st.warning("편집할 일정이 없습니다. 먼저 여행지를 검색해 주세요.")
+    else:
+        header, back = st.columns([4, 1], vertical_alignment="center")
+        with header:
+            st.title("여행 일정 편집")
+        with back:
+            if st.button("← 대시보드", key="trip_629_edit_back", type="primary",
+                         use_container_width=True):
+                st.session_state.trip_629_edit_page = False
+                st.rerun()
+        st.caption("방문 순서 변경, 장소 삭제, 장소 추가·교체를 이 화면에서 진행합니다. 변경 내용은 대시보드와 지도에 반영됩니다.")
+        with st.expander("장소 검색 · 일정에 추가 또는 교체", expanded=False):
+            render_place_search_editor(editable, str((st.session_state.get("search_result") or {}).get("query", "")))
+        if st.session_state.get("trip_edit_last_change"):
+            st.success("일정 반영 완료: " + st.session_state.trip_edit_last_change)
+            st.session_state.trip_edit_last_change = ""
+        render_editable_itinerary(st.session_state.trip_editable_itinerary)
+        st.divider()
+        if st.button("편집 완료 · 대시보드로 돌아가기", key="trip_629_edit_finish",
+                     type="primary", use_container_width=True):
+            st.session_state.trip_629_edit_page = False
+            st.rerun()
+        st.stop()
+
 st.markdown('<div class="brand-mark">✦ 국내 여행 검색</div>', unsafe_allow_html=True)
 st.title("TRIP FINDER")
 st.markdown(
@@ -2835,6 +2872,7 @@ if "destination_location" not in st.session_state:
     st.session_state.destination_location = {}
 
 if submitted:
+    st.session_state.trip_629_edit_page = False
     st.session_state.trip_search_version = st.session_state.get("trip_search_version", 0) + 1
     st.session_state.trip_edit_search_results = []
     st.session_state.trip_edit_search_error = ""
@@ -3151,19 +3189,17 @@ if search_result:
             "실제 영업 여부는 확인하지 않았습니다."
         )
         location_itinerary = st.session_state.trip_editable_itinerary
-        # 장소 검색/적용을 먼저 처리해 아래 일정표가 최신 세션 상태를 표시하도록 합니다.
-        with st.expander("장소 검색 · 일정에 추가 또는 교체", expanded=False):
-            render_place_search_editor(location_itinerary, query)
-        if st.session_state.get("trip_edit_last_change"):
-            st.success("일정 반영 완료: " + st.session_state.trip_edit_last_change)
-            st.session_state.trip_edit_last_change = ""
+        # 6-29 화면 순서: 통합 대시보드 → 여행 동선 지도 → 여행 일정 관리.
+        # 장소 편집은 대시보드 오른쪽 상단의 편집 버튼으로 전용 화면에서 수행합니다.
         location_itinerary = st.session_state.trip_editable_itinerary
-        render_editable_itinerary(location_itinerary)
+        render_trip_dashboard(location_itinerary, selected_transport, query, selected_duration)
+        render_itinerary_map(location_itinerary)
+        st.markdown("---")
+        st.subheader("여행 일정 관리")
         render_time_schedule(location_itinerary, selected_transport, query)
         render_trip_progress(location_itinerary)
         render_trip_replan(location_itinerary, selected_transport)
         render_trip_alerts(location_itinerary, selected_transport)
-        render_trip_dashboard(location_itinerary, selected_transport, query, selected_duration)
         with st.expander("일정 추천 품질 점검", expanded=False):
             st.caption("방문 장소 중복·긴 직선 이동·식사 누락을 점검합니다. 실제 도로 경로, 영업시간, 리뷰 평점은 검증하지 않습니다.")
             quality_notes = _itinerary_quality_notes(location_itinerary, selected_transport)
@@ -3184,7 +3220,6 @@ if search_result:
         else:
             st.info("실제 관광지 검색 결과가 없어 여행 코스를 생성하지 않았습니다.")
 
-    render_itinerary_map(location_itinerary)
     if location_itinerary:
         render_trip_exports(location_itinerary, query, selected_duration, "current")
         st.markdown("---")
