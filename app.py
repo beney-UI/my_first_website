@@ -1111,9 +1111,78 @@ def render_integrity_audit(itinerary: list, transport: str) -> None:
         st.caption("이 점검은 일정 데이터를 변경하지 않습니다. 지도 표시·API 응답·실제 교통시간·영업 여부를 검증하는 것은 아닙니다.")
 
 
+def _lodging_day_schedule(activities: list, transport: str, day_start: int, pace: str,
+                          lodging: dict | None, is_first: bool, is_last: bool,
+                          checkin_hour: int, checkout_hour: int) -> tuple[list[dict], int, int]:
+    """Include lodging check-in/out as actual schedule rows, not just annotations."""
+    if not lodging:
+        return _schedule_for_day(activities, transport, day_start, pace)
+    if is_first and is_last:
+        return _schedule_for_day(activities, transport, day_start, pace)
+    if is_last:
+        rows = [{"시간": f"{checkout_hour:02d}:00", "구분": "숙소 체크아웃",
+                 "장소/활동": lodging.get("name", "숙소"), "소요": "기준 시각", "비고": "예약 숙소 규정 확인"}]
+        visits, finish, travel = _schedule_for_day(activities, transport, checkout_hour, pace,
+                                                   start_anchor=lodging)
+        return rows + visits, finish, travel
+    rows, finish, travel = _schedule_for_day(activities, transport, day_start, pace,
+                                            end_anchor=lodging)
+    checkin_at = checkin_hour * 60
+    if is_first and finish < checkin_at:
+        rows.append({"시간": f"{_clock(finish)}–{_clock(checkin_at)}", "구분": "체크인 대기/휴식",
+                     "장소/활동": lodging.get("name", "숙소"),
+                     "소요": f"약 {checkin_at-finish}분", "비고": "체크인 가능시각 이전 도착"})
+        finish = checkin_at
+    rows.append({"시간": _clock(finish), "구분": "숙소 체크인" if is_first else "숙소 복귀",
+                 "장소/활동": lodging.get("name", "숙소"), "소요": "기준 시각", "비고": "예약 숙소 규정 확인" if is_first else ""})
+    return rows, finish, travel
+
+
+def render_trip_progress(itinerary: list) -> None:
+    """6-24: Explicit manual visit states. No GPS or automatic arrival detection."""
+    st.markdown("#### 여행 진행 관리 · 6-24")
+    st.caption("여행 중 방문 상태를 직접 선택하세요. 진행 상태는 현재 브라우저 세션에 저장되며 자동으로 위치를 추적하지 않습니다.")
+    key = "trip_624_visit_states"
+    states = st.session_state.setdefault(key, {})
+    status_options = ["방문 예정", "방문 중", "방문 완료", "방문 취소"]
+    total = done = 0
+    for day, activities in itinerary:
+        visits = [(idx, a) for idx, a in enumerate(activities) if is_editable_visit(a)]
+        total += len(visits)
+        for idx, activity in visits:
+            visit_id = f"{day}:{_place_identity(activity) or activity.get('name', '')}:{idx}"
+            if states.get(visit_id) == "방문 완료":
+                done += 1
+    c1, c2, c3 = st.columns(3)
+    c1.metric("전체 방문지", total)
+    c2.metric("방문 완료", done)
+    c3.metric("남은 방문지", max(0, total-done))
+    if total:
+        st.progress(done / total)
+    for day, activities in itinerary:
+        visits = [(idx, a) for idx, a in enumerate(activities) if is_editable_visit(a)]
+        with st.expander(f"{day}일 차 · 방문 상태", expanded=day == itinerary[0][0]):
+            if not visits:
+                st.info("등록된 방문 장소가 없습니다.")
+            for idx, activity in visits:
+                visit_id = f"{day}:{_place_identity(activity) or activity.get('name', '')}:{idx}"
+                left, right = st.columns([3, 2])
+                with left:
+                    st.write(f"{activity.get('type', '장소')} · {activity.get('name', '이름 없음')}")
+                with right:
+                    current = states.get(visit_id, "방문 예정")
+                    new = st.selectbox("방문 상태", status_options, index=status_options.index(current),
+                                       key=f"trip_624_state_{visit_id}", label_visibility="collapsed")
+                    if new != current:
+                        states[visit_id] = new
+                        st.session_state[key] = states
+                        st.rerun()
+    st.caption("방문 취소는 상태만 변경하며 장소를 자동 삭제하거나 남은 일정을 재계산하지 않습니다. 자동 재조정은 다음 단계에서 연결합니다.")
+
+
 def render_time_schedule(itinerary: list, transport: str, destination: str = "") -> None:
     st.markdown("#### 예상 시간표 · 일정 현실성 점검")
-    st.caption("6-23: 첫날 도착·마지막 날 출발·선택한 숙소의 이동을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
+    st.caption("6-24: 첫날 도착·마지막 날 출발·숙소 체크인·체크아웃을 고려합니다. 시간과 이동거리는 추정이며 실제 교통편·운영시간을 확인하지 않습니다.")
     a, b, c = st.columns(3)
     with a:
         start_hour = st.selectbox("중간 날짜 출발 시각", list(range(7, 13)), index=2,
@@ -1136,6 +1205,17 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
                                  format_func=lambda h: f"{h:02d}:00", key="trip_618_departure")
 
     lodging = st.session_state.get("trip_623_selected_lodging") if len(itinerary) > 1 else None
+    checkin_hour, checkout_hour = 15, 11
+    if lodging:
+        st.markdown("##### 숙소 체크인·체크아웃")
+        in_col, out_col = st.columns(2)
+        with in_col:
+            checkin_hour = st.selectbox("체크인 가능 시각", list(range(12, 23)), index=3,
+                                         format_func=lambda h: f"{h:02d}:00", key="trip_624_checkin")
+        with out_col:
+            checkout_hour = st.selectbox("체크아웃 시각", list(range(7, 16)), index=4,
+                                          format_func=lambda h: f"{h:02d}:00", key="trip_624_checkout")
+        st.caption("기본값: 체크인 15:00 · 체크아웃 11:00. 실제 숙소 예약 안내에 맞게 변경하세요.")
     if len(itinerary) > 1:
         if lodging:
             st.info(f"숙소 기준 시간표: {lodging.get('name', '')} · {lodging.get('address', '')}")
@@ -1154,10 +1234,12 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
             continue
         # 숙소를 선택했다면 첫날 관광 후 숙소까지, 중간 날은 숙소 왕복,
         # 마지막 날은 숙소에서 첫 관광지까지의 이동을 포함합니다.
-        from_lodging = lodging if lodging and not is_first else None
-        to_lodging = lodging if lodging and not is_last else None
-        rows, finish, travel = _schedule_for_day(activities, transport, day_start, pace,
-                                                  start_anchor=from_lodging, end_anchor=to_lodging)
+        if lodging and is_last and checkout_hour >= day_end:
+            st.warning(f"{day}일 차: 체크아웃 {checkout_hour:02d}:00이 귀가 출발 {day_end:02d}:00보다 늦거나 같습니다. 시간을 조정해 주세요.")
+        rows, finish, travel = _lodging_day_schedule(
+            activities, transport, day_start, pace, lodging, is_first, is_last,
+            checkin_hour, checkout_hour
+        )
         title = f"{day}일 차 · 예상 종료 {_clock(finish)} · 이동 약 {travel}분"
         with st.expander(title, expanded=is_first):
             if is_first:
@@ -1180,7 +1262,7 @@ def render_time_schedule(itinerary: list, transport: str, destination: str = "")
                 st.warning("식사 장소가 없습니다.")
             if is_last:
                 st.caption("귀가 출발시각은 여행지에서 귀가를 시작하는 시각입니다. 공항·역 이동 및 수속시간은 별도로 고려하세요.")
-            st.caption("일정 편집 시 자동 재계산됩니다. 도로·버스 경로, 실시간 교통, 영업시간, 숙소 체크인 가능시간은 미확인입니다.")
+            st.caption("일정 편집 시 자동 재계산됩니다. 도로·버스 경로, 실시간 교통, 영업시간은 미확인입니다. 체크인·체크아웃은 입력한 기준 시각을 사용합니다.")
     render_auto_adjustment(itinerary, transport, lodging, start_hour, end_hour, arrival, departure, pace)
     render_integrity_audit(itinerary, transport)
     st.info("숙소는 최초 추천 권역과 이동시간 추정에 반영됩니다. 자동 조정은 미리보기 후 적용 버튼을 눌러야 실제 일정에 반영됩니다.")
@@ -2566,6 +2648,7 @@ if search_result:
             )
             st.session_state.trip_original_itinerary = deepcopy(original_itinerary)
             st.session_state.trip_editable_itinerary = deepcopy(original_itinerary)
+            st.session_state.trip_624_visit_states = {}
             st.session_state.trip_nearby_message = nearby_response.get("message", "")
             st.session_state.trip_itinerary_version = itinerary_key
 
@@ -2590,6 +2673,7 @@ if search_result:
         location_itinerary = st.session_state.trip_editable_itinerary
         render_editable_itinerary(location_itinerary)
         render_time_schedule(location_itinerary, selected_transport, query)
+        render_trip_progress(location_itinerary)
         with st.expander("일정 추천 품질 점검", expanded=False):
             st.caption("방문 장소 중복·긴 직선 이동·식사 누락을 점검합니다. 실제 도로 경로, 영업시간, 리뷰 평점은 검증하지 않습니다.")
             quality_notes = _itinerary_quality_notes(location_itinerary, selected_transport)
