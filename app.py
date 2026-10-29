@@ -8,7 +8,8 @@ from urllib.error import HTTPError, URLError
 import json
 import requests
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 
 import folium
 import streamlit as st
@@ -1255,6 +1256,141 @@ def render_trip_progress(itinerary: list) -> None:
                         st.session_state[key] = states
                         st.rerun()
     st.caption("방문 취소는 상태만 변경하며 장소를 자동 삭제하거나 남은 일정을 재계산하지 않습니다. 자동 재조정은 다음 단계에서 연결합니다.")
+
+
+def _alert_time_minutes(value: str) -> int | None:
+    """Read the first HH:MM of an itinerary row, including en-dash ranges."""
+    import re
+    match = re.match(r"^(\d{1,2}):(\d{2})", str(value).strip())
+    if not match:
+        return None
+    hour, minute = map(int, match.groups())
+    return hour * 60 + minute if hour < 24 and minute < 60 else None
+
+
+def _alert_schedule_rows(itinerary: list, transport: str, lodging: dict | None) -> list[dict]:
+    """Build notifications from the exact time schedule settings (no invented ETAs)."""
+    if not itinerary:
+        return []
+    start = int(st.session_state.get("trip_617_start", 9))
+    pace = st.session_state.get("trip_617_pace", "보통")
+    arrival = int(st.session_state.get("trip_618_arrival", 13))
+    checkin = int(st.session_state.get("trip_624_checkin", 15))
+    checkout = int(st.session_state.get("trip_624_checkout", 11))
+    events = []
+    for day, activities in itinerary:
+        rows, _, _ = _lodging_day_schedule(
+            activities, transport, arrival if day == itinerary[0][0] else start,
+            pace, lodging, day == itinerary[0][0], day == itinerary[-1][0],
+            checkin, checkout,
+        )
+        for row in rows:
+            kind = str(row.get("구분", ""))
+            if kind not in ("이동 (추정)", "숙소 체크인", "숙소 체크아웃", "숙소 복귀", "관광", "점심 식사", "저녁 식사", "식사", "카페·휴식"):
+                continue
+            minute = _alert_time_minutes(row.get("시간", ""))
+            if minute is None:
+                continue
+            events.append({"day": day, "minute": minute, "kind": kind,
+                           "place": str(row.get("장소/활동", ""))})
+    return events
+
+
+def _alert_visit_status(itinerary: list, day: int, name: str) -> str:
+    states = st.session_state.get("trip_624_visit_states", {})
+    for d, activities in itinerary:
+        if d != day:
+            continue
+        for idx, activity in enumerate(activities):
+            if activity.get("name") == name and is_editable_visit(activity):
+                visit_id = f"{day}:{_place_identity(activity) or activity.get('name', '')}:{idx}"
+                return states.get(visit_id, "방문 예정")
+    return "방문 예정"
+
+
+def _render_trip_alert_live() -> None:
+    """Refresh visible on-page guidance while the Streamlit tab stays connected."""
+    data = st.session_state.get("trip_625_alert_data", {})
+    if not data or not data.get("enabled"):
+        return
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    today = now.date()
+    start_date = data["start_date"]
+    day = (today - start_date).days + 1
+    events = [e for e in data["events"] if e["day"] == day]
+    if day < 1:
+        st.info(f"여행 시작 예정: {start_date.isoformat()} · 현재 한국시간 {now:%H:%M}")
+        return
+    if not events:
+        st.info(f"현재 한국시간 {now:%H:%M} · 오늘 예정된 알림 대상 일정이 없습니다.")
+        return
+    current = now.hour * 60 + now.minute
+    lead = data["lead"]
+    itinerary = data["itinerary"]
+    future = []
+    for event in events:
+        if event["kind"] not in ("이동 (추정)", "숙소 체크인", "숙소 체크아웃", "숙소 복귀"):
+            if _alert_visit_status(itinerary, day, event["place"]) in ("방문 완료", "방문 취소"):
+                continue
+        future.append(event)
+    imminent = [e for e in future if 0 <= e["minute"] - current <= lead]
+    ongoing = [e for e in future if -10 <= e["minute"] - current < 0]
+    if imminent:
+        event = imminent[0]
+        remaining = event["minute"] - current
+        st.warning(f"일정 안내 · {remaining}분 후 {event['kind']}: {event['place']} (예정 {event['minute']//60:02d}:{event['minute']%60:02d})")
+    elif ongoing:
+        event = ongoing[0]
+        st.warning(f"지금 확인할 일정 · {event['kind']}: {event['place']} (예정 {event['minute']//60:02d}:{event['minute']%60:02d})")
+    else:
+        upcoming = [e for e in future if e["minute"] >= current]
+        if upcoming:
+            event = upcoming[0]
+            st.info(f"현재 한국시간 {now:%H:%M} · 다음 일정 {event['minute']//60:02d}:{event['minute']%60:02d} · {event['kind']} · {event['place']}")
+        else:
+            st.success(f"현재 한국시간 {now:%H:%M} · 오늘 예정된 알림 대상 일정이 종료되었습니다.")
+
+
+# Streamlit 1.37+ fragments rerun without rerunning the entire search page.
+if hasattr(st, "fragment"):
+    _render_trip_alert_live = st.fragment(run_every="30s")(_render_trip_alert_live)
+
+
+def render_trip_alerts(itinerary: list, transport: str) -> None:
+    """6-25: In-app time reminders; not background push notifications."""
+    st.markdown("#### 여행 일정 시간 알림 · 6-25")
+    st.caption("한국시간 기준으로 웹페이지가 열려 있는 동안 다음 일정과 이동 예정 시각을 안내합니다. 휴대전화 푸시·문자·백그라운드 알림은 제공하지 않습니다.")
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        trip_start = st.date_input("여행 시작 날짜", value=date.today(), key="trip_625_start_date")
+    with col2:
+        lead = st.selectbox("사전 안내", [5, 10, 15, 30, 60], index=2,
+                            format_func=lambda n: f"{n}분 전", key="trip_625_lead")
+    with col3:
+        enabled = st.checkbox("시간 알림 사용", value=False, key="trip_625_enabled")
+    if not enabled:
+        st.info("시간 알림이 꺼져 있습니다. 여행 시작 날짜를 설정하고 '시간 알림 사용'을 체크해 주세요.")
+        st.session_state.trip_625_alert_data = {"enabled": False}
+        return
+    events = _alert_schedule_rows(itinerary, transport,
+                                  st.session_state.get("trip_623_selected_lodging"))
+    st.session_state.trip_625_alert_data = {
+        "enabled": True, "start_date": trip_start, "lead": lead,
+        "events": events, "itinerary": itinerary,
+    }
+    if not events:
+        st.warning("안내할 일정이 없습니다. 먼저 여행 시간표를 생성해 주세요.")
+        return
+    _render_trip_alert_live()
+    with st.expander("날짜별 알림 예정 목록", expanded=False):
+        for day, _ in itinerary:
+            subset = [e for e in events if e["day"] == day]
+            if subset:
+                st.write(f"**{day}일 차 · {(trip_start + timedelta(days=day-1)).isoformat()}**")
+                st.dataframe([{"예정 시간": f"{e['minute']//60:02d}:{e['minute']%60:02d}",
+                               "구분": e["kind"], "장소/활동": e["place"]}
+                              for e in subset], hide_index=True, use_container_width=True)
+    st.caption("실제 이동·도착 여부를 자동 감지하지 않습니다. 일정표를 수정하면 알림 목록도 다시 계산됩니다. 웹페이지 연결이 끊기면 안내가 중단될 수 있습니다.")
 
 
 def render_time_schedule(itinerary: list, transport: str, destination: str = "") -> None:
@@ -2755,6 +2891,7 @@ if search_result:
         render_editable_itinerary(location_itinerary)
         render_time_schedule(location_itinerary, selected_transport, query)
         render_trip_progress(location_itinerary)
+        render_trip_alerts(location_itinerary, selected_transport)
         with st.expander("일정 추천 품질 점검", expanded=False):
             st.caption("방문 장소 중복·긴 직선 이동·식사 누락을 점검합니다. 실제 도로 경로, 영업시간, 리뷰 평점은 검증하지 않습니다.")
             quality_notes = _itinerary_quality_notes(location_itinerary, selected_transport)
