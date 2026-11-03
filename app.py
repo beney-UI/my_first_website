@@ -1490,10 +1490,129 @@ def render_trip_638_rebalance(itinerary: list, transport: str) -> None:
         )
 
 
+def _trip_639_quality_report(itinerary: list, transport: str) -> list[dict]:
+    """Inspect the current dashboard rows; no external opening-hours claims."""
+    rows = _trip_628_dashboard_rows(itinerary, transport)
+    report = []
+    for day, activities in itinerary:
+        day_rows = [r for r in rows if r.get("일차") == f"{day}일 차"]
+        issues = []
+        meal_rows = []
+        cafe_rows = []
+        hotel_transfer = 0
+        lodging = st.session_state.get("trip_623_selected_lodging")
+        hotel_name = str(lodging.get("name", "")) if lodging else ""
+        for row in day_rows:
+            kind = row.get("구분", "")
+            time_string = str(row.get("시간", ""))
+            start = _trip_637_time_minutes(time_string.split("–")[0])
+            if kind in ("식사", "점심 식사", "저녁 식사"):
+                meal_rows.append((row.get("장소/활동", ""), start, kind))
+            if kind == "카페·휴식":
+                cafe_rows.append((row.get("장소/활동", ""), start))
+            if kind == "이동 (추정)" and hotel_name and hotel_name in str(row.get("장소/활동", "")):
+                import re
+                minutes = re.search(r"(\d+)분", str(row.get("소요", "")))
+                if minutes:
+                    hotel_transfer += int(minutes.group(1))
+        if not meal_rows:
+            issues.append("식사 장소가 없습니다. 실제 식사 계획을 확인하세요.")
+        for name, minute, kind in meal_rows:
+            if minute is None:
+                issues.append(f"{name}: 식사 시작 시각을 해석할 수 없습니다.")
+                continue
+            hour = minute / 60
+            if kind == "점심 식사" and not 11 <= hour < 15:
+                issues.append(f"{name}: 점심 식사 시작이 {_clock(minute)}로 점심 권장 시간대(11~15시) 밖입니다.")
+            elif kind == "저녁 식사" and not 17 <= hour < 21:
+                issues.append(f"{name}: 저녁 식사 시작이 {_clock(minute)}로 저녁 권장 시간대(17~21시) 밖입니다.")
+            elif kind == "식사" and not (11 <= hour < 15 or 17 <= hour < 21):
+                issues.append(f"{name}: 식사 시작이 {_clock(minute)}입니다. 식사 시간대를 확인하세요.")
+        for name, minute in cafe_rows:
+            if minute is not None and minute >= 21 * 60:
+                issues.append(f"{name}: 카페 방문 시작이 {_clock(minute)}입니다. 영업시간 확인이 필요합니다.")
+        if hotel_name and hotel_transfer >= 90:
+            issues.append(f"숙소 연계 추정 이동시간이 {hotel_transfer}분입니다. 숙소 주변 동선을 확인하세요.")
+        report.append({"day": day, "issues": issues, "meals": meal_rows,
+                       "cafes": cafe_rows, "hotel_transfer": hotel_transfer})
+    return report
+
+
+def _trip_639_meal_reorder_proposal(itinerary: list, transport: str, day: int) -> dict | None:
+    """Move one non-manual meal within its day if its estimated time improves.
+
+    Preserve all non-meal visit order and reject worsening end-time or any
+    additional meal-time violations. This is a suggestion, not an auto-change.
+    """
+    position = next((i for i, (d, _) in enumerate(itinerary) if d == day), None)
+    if position is None:
+        return None
+    activities = itinerary[position][1]
+    meal_positions = [i for i, a in enumerate(activities)
+                      if a.get("type") in ("식사", "점심 식사", "저녁 식사")
+                      and not a.get("manual_edit")]
+    if not meal_positions:
+        return None
+    original = _trip_639_quality_report(itinerary, transport)[position]
+    original_meal_issues = sum("식사 시작" in x for x in original["issues"])
+    original_meal_issues += sum("점심 식사 시작" in x or "저녁 식사 시작" in x for x in original["issues"])
+    if not original_meal_issues:
+        return None
+    original_finish = _trip_637_day_findings(itinerary, transport)[position]["finish"]
+    best = None
+    for meal_idx in meal_positions:
+        for target in range(len(activities)):
+            if target == meal_idx:
+                continue
+            trial = deepcopy(itinerary)
+            day_activities = trial[position][1]
+            moved = day_activities.pop(meal_idx)
+            day_activities.insert(target, moved)
+            if [a.get("name") for a in day_activities if a.get("type") not in
+                ("식사", "점심 식사", "저녁 식사")] != [a.get("name") for a in activities if a.get("type") not in
+                ("식사", "점심 식사", "저녁 식사")]:
+                continue
+            report = _trip_639_quality_report(trial, transport)[position]
+            meal_issues = sum("식사 시작" in x for x in report["issues"])
+            if meal_issues >= original_meal_issues:
+                continue
+            finish = _trip_637_day_findings(trial, transport)[position]["finish"]
+            if original_finish is not None and (finish is None or finish > original_finish):
+                continue
+            score = (meal_issues, finish if finish is not None else 10**9)
+            if best is None or score < best["score"]:
+                best = {"itinerary": trial, "name": moved.get("name", "식사"),
+                        "day": day, "score": score, "before": original_meal_issues,
+                        "after": meal_issues}
+    return best
+
+
+def render_trip_639_quality(itinerary: list, transport: str) -> None:
+    st.markdown("#### 6-39 · 식사 시간·카페·숙소 동선 점검")
+    st.caption("통합 대시보드의 현재 시간표를 기준으로 점검합니다. 식사 권장 시간대는 편의상 설정한 기준이며, 실제 영업시간·도로 이동시간은 확인하지 않습니다.")
+    for item in _trip_639_quality_report(itinerary, transport):
+        day = item["day"]
+        with st.expander(f"{day}일 차 · 점검 {len(item['issues'])}건", expanded=bool(item["issues"])):
+            if item["issues"]:
+                for issue in item["issues"]:
+                    st.warning(issue)
+            else:
+                st.success("설정된 간이 점검 기준에서 경고가 없습니다.")
+            for name, minute, kind in item["meals"]:
+                st.write(f"식사: {name} · {(_clock(minute) if minute is not None else '시간 확인 불가')}")
+            proposal = _trip_639_meal_reorder_proposal(itinerary, transport, day)
+            if proposal:
+                st.info(f"식사 순서 변경 제안: {proposal['name']} · 식사 시간대 경고 {proposal['before']}건 → {proposal['after']}건")
+                if st.button(f"{day}일 차 식사 순서 변경 적용", key=f"trip_639_apply_{day}"):
+                    st.session_state["trip_624_visit_states"] = {}
+                    _trip_631_update_itinerary(proposal["itinerary"], f"{day}일 차 식사 순서를 변경했습니다. 방문 상태는 초기화했습니다.")
+    st.caption("실제 식당 예약·운영시간, 반려견 동반 가능 여부는 직접 확인해야 합니다.")
+
+
 def render_trip_dashboard(itinerary: list, transport: str, destination: str, duration: str) -> None:
     """6-28: Free, session-local dashboard synchronized to the current itinerary."""
     st.markdown("---")
-    st.subheader("여행 일정 통합 대시보드 · 6-38")
+    st.subheader("여행 일정 통합 대시보드 · 6-39")
     st.caption("현재 편집한 일정과 승인된 6-26 재조정안을 기준으로 표시합니다. 유료 AI API는 사용하지 않습니다.")
     if not itinerary:
         st.info("대시보드에 표시할 일정이 없습니다.")
@@ -1565,6 +1684,7 @@ def render_trip_dashboard(itinerary: list, transport: str, destination: str, dur
     render_trip_inline_editor(itinerary, destination)
     render_trip_637_review(itinerary, transport)
     render_trip_638_rebalance(itinerary, transport)
+    render_trip_639_quality(itinerary, transport)
     with st.expander("통합 일정 검수 · 시간 초과 / 중복 / 이동거리", expanded=False):
         st.caption("현재 통합 대시보드 일정 전체를 기준으로 검수합니다. 수정 후 다시 검수할 수 있습니다.")
         render_integrity_audit(itinerary, transport)
