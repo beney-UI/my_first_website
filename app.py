@@ -1422,10 +1422,78 @@ def render_trip_637_review(itinerary: list, transport: str) -> None:
     st.caption("순서 변경은 선택 사항입니다. 장소의 방문 가능 시간, 실제 도로 이동시간, 예약 여부는 별도로 확인하세요.")
 
 
+def _trip_638_rebalance_proposal(itinerary: list, transport: str) -> dict | None:
+    """Suggest moving one non-manual attraction to the following day.
+
+    A proposal is valid only if the source improves and the destination remains
+    within its configured end-time limit. No mutation occurs here.
+    """
+    if len(itinerary) < 2:
+        return None
+    baseline = _trip_637_day_findings(itinerary, transport)
+    for source_idx in range(len(itinerary) - 1):
+        source = baseline[source_idx]
+        if source["finish"] is None or source["finish"] <= source["limit"]:
+            continue
+        day, activities = itinerary[source_idx]
+        next_day, next_activities = itinerary[source_idx + 1]
+        # Do not relocate explicitly chosen or manually edited visits.
+        options = [(i, a) for i, a in enumerate(activities)
+                   if a.get("type") == "관광" and not a.get("manual_edit")]
+        for item_idx, activity in reversed(options):
+            trial = deepcopy(itinerary)
+            moved = trial[source_idx][1].pop(item_idx)
+            insert_at = next((i for i, a in enumerate(trial[source_idx + 1][1])
+                              if a.get("type") == "이동 참고"), len(trial[source_idx + 1][1]))
+            trial[source_idx + 1][1].insert(insert_at, moved)
+            updated = _trip_637_day_findings(trial, transport)
+            new_source = updated[source_idx]
+            new_target = updated[source_idx + 1]
+            if (new_source["finish"] is not None and new_target["finish"] is not None
+                    and new_source["finish"] < source["finish"]
+                    and new_target["finish"] <= new_target["limit"]):
+                return {"itinerary": trial, "name": activity.get("name", "관광지"),
+                        "from_day": day, "to_day": next_day,
+                        "old_finish": source["finish"], "new_finish": new_source["finish"],
+                        "target_finish": new_target["finish"]}
+    return None
+
+
+def render_trip_638_rebalance(itinerary: list, transport: str) -> None:
+    st.markdown("#### 6-38 · 과밀 일정 분산 제안")
+    st.caption("종료 기준을 초과한 날짜에서 다음 날로 관광지 1곳을 이동하는 안을 계산합니다. "
+               "사용자가 직접 선택·편집한 장소와 식사·카페는 이동하지 않습니다.")
+    findings = _trip_637_day_findings(itinerary, transport)
+    overloaded = [item for item in findings
+                  if item["finish"] is not None and item["finish"] > item["limit"]]
+    if not overloaded:
+        st.success("현재 시간 추정 기준으로 종료 시각을 초과하는 날짜가 없습니다.")
+        return
+    proposal = _trip_638_rebalance_proposal(itinerary, transport)
+    if proposal is None:
+        st.info("자동 분산 조건을 충족하는 다음 날이 없습니다. "
+                "통합 일정 편집에서 날짜를 직접 변경하거나 방문 장소를 조정해 주세요.")
+        return
+    st.write(f"**이동 제안:** {proposal['name']} · "
+             f"{proposal['from_day']}일 차 → {proposal['to_day']}일 차")
+    st.write(f"기존 날짜 예상 종료: {_clock(proposal['old_finish'])} → "
+             f"{_clock(proposal['new_finish'])}")
+    st.write(f"이동할 날짜 예상 종료: {_clock(proposal['target_finish'])}")
+    st.caption("예상 시간은 기존 일정 계산 방식에 따른 추정치입니다. "
+               "실제 영업시간·예약·도로 교통상황을 검증한 결과는 아닙니다.")
+    if st.button("이 분산안 적용", key="trip_638_apply", type="secondary"):
+        st.session_state["trip_624_visit_states"] = {}
+        _trip_631_update_itinerary(
+            proposal["itinerary"],
+            f"{proposal['name']} · {proposal['from_day']}일 차에서 "
+            f"{proposal['to_day']}일 차로 이동 (방문 진행 상태 초기화)",
+        )
+
+
 def render_trip_dashboard(itinerary: list, transport: str, destination: str, duration: str) -> None:
     """6-28: Free, session-local dashboard synchronized to the current itinerary."""
     st.markdown("---")
-    st.subheader("여행 일정 통합 대시보드 · 6-37")
+    st.subheader("여행 일정 통합 대시보드 · 6-38")
     st.caption("현재 편집한 일정과 승인된 6-26 재조정안을 기준으로 표시합니다. 유료 AI API는 사용하지 않습니다.")
     if not itinerary:
         st.info("대시보드에 표시할 일정이 없습니다.")
@@ -1496,6 +1564,7 @@ def render_trip_dashboard(itinerary: list, transport: str, destination: str, dur
     st.caption("다운로드한 CSV 파일은 이후 일정 변경 시 자동 갱신되지 않습니다. 변경 후 다시 다운로드하세요. 브라우저 세션 종료 시 진행 상태가 사라질 수 있습니다.")
     render_trip_inline_editor(itinerary, destination)
     render_trip_637_review(itinerary, transport)
+    render_trip_638_rebalance(itinerary, transport)
     with st.expander("통합 일정 검수 · 시간 초과 / 중복 / 이동거리", expanded=False):
         st.caption("현재 통합 대시보드 일정 전체를 기준으로 검수합니다. 수정 후 다시 검수할 수 있습니다.")
         render_integrity_audit(itinerary, transport)
