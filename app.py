@@ -2995,7 +2995,9 @@ def _trip_634_parse_query(raw: str) -> tuple[dict | None, str]:
         text = text[:m.start()] + " " + text[m.end():]
     if not 1 <= days <= MAX_TRAVEL_DAYS:
         return None, f"여행 기간은 1~{MAX_TRAVEL_DAYS}일만 지원합니다."
-    text = re.sub(r"(?:여행|놀러|갈\s*거야|갈거야|가려고|가고\s*싶어|갑니다|갈래|다녀올\s*거야|다녀올거야|계획이야|으로|로|에|에서|가자|갈게)", " ", text)
+    text = re.sub(r"(?:여행|놀러|갈\s*거야|갈거야|가려고|가고\s*싶어|갑니다|갈래|다녀올\s*거야|다녀올거야|계획이야|가자|갈게)", " ", text)
+    # Remove Korean postpositions only at token boundaries, never inside city names.
+    text = re.sub(r"(으로|에서|로|에)(?=\s|$)", "", text)
     text = " ".join(text.split()).strip()
     if not text:
         return None, "여행 지역을 확인할 수 없습니다. 예: 속초 2박 3일"
@@ -3006,22 +3008,53 @@ def _trip_634_parse_query(raw: str) -> tuple[dict | None, str]:
     return {"destination": text, "days": days}, ""
 
 
-def _trip_634_preview_cards(places: list, city: str, section: str, limit: int = 12) -> None:
+def _trip_635_place_id(place: dict) -> str:
+    """Stable-enough ID across reruns and ranking; no API assumptions."""
+    return "|".join(str(place.get(k) or "").strip() for k in ("name", "address", "road_address"))
+
+
+def _trip_635_preview_cards(places: list, section: str, limit: int = 12) -> None:
+    """Preview candidates without constructing a day-by-day itinerary."""
     if not places:
-        st.info(f"{section} 검색 결과가 없습니다. 외부 API 설정이나 검색 범위를 확인해 주세요.")
+        st.info(f"{section} 검색 결과가 없습니다. API 설정이나 검색 범위를 확인해 주세요.")
         return
+    favorites = st.session_state.setdefault("trip_635_favorites", [])
+    excluded = st.session_state.setdefault("trip_635_excluded", [])
     for place in places[:limit]:
         name = str(place.get("name") or "이름 없음")
         address = str(place.get("address") or place.get("road_address") or "주소 정보 없음")
         category = str(place.get("category") or "")
+        pid = _trip_635_place_id(place)
         st.markdown(f"**{escape(name)}**")
         st.caption(" · ".join(x for x in (address, category) if x))
         link = place.get("url") or place.get("place_url")
         if isinstance(link, str) and link.startswith(("https://", "http://")):
             st.markdown(f"[장소 정보 확인]({link})")
+        left, right = st.columns(2)
+        with left:
+            fav = st.checkbox("가고 싶어요", value=pid in favorites,
+                              key=f"trip_635_fav_{section}_{pid}")
+        with right:
+            exclude = st.checkbox("일정에서 제외", value=pid in excluded,
+                                  key=f"trip_635_ex_{section}_{pid}")
+        if fav and pid not in favorites:
+            favorites.append(pid)
+        if not fav and pid in favorites:
+            favorites.remove(pid)
+        if exclude and pid not in excluded:
+            excluded.append(pid)
+        if not exclude and pid in excluded:
+            excluded.remove(pid)
         st.divider()
     if len(places) > limit:
         st.caption(f"전체 {len(places)}곳 중 {limit}곳만 미리 보여줍니다.")
+
+
+def _trip_635_rank_preferences(places: list) -> list:
+    favorites = set(st.session_state.get("trip_635_favorites", []))
+    excluded = set(st.session_state.get("trip_635_excluded", []))
+    kept = [p for p in places if _trip_635_place_id(p) not in excluded]
+    return sorted(kept, key=lambda p: _trip_635_place_id(p) not in favorites)
 
 
 def _trip_634_personalize(search: dict) -> None:
@@ -3068,6 +3101,7 @@ def _trip_634_personalize(search: dict) -> None:
         "pet_enabled": pet == "네", "transport": transport,
         "travel_style": primary, "lodging_query": lodging.strip(),
         "trip_634_stage": "itinerary",
+        "trip_635_preference_enabled": True,
     })
     st.session_state["trip_617_pace"] = pace
     st.session_state["trip_618_arrival"] = arrival
@@ -3256,6 +3290,8 @@ if "destination_location" not in st.session_state:
 if submitted:
     st.session_state.trip_629_edit_page = False
     st.session_state.trip_search_version = st.session_state.get("trip_search_version", 0) + 1
+    st.session_state.trip_635_favorites = []
+    st.session_state.trip_635_excluded = []
     st.session_state.trip_edit_search_results = []
     st.session_state.trip_edit_search_error = ""
     if not destination_query.strip():
@@ -3413,20 +3449,23 @@ if search_result and st.session_state.restaurant_region_candidates:
 
 if search_result and search_result.get("trip_634_stage") == "preview":
     preview_query = search_result.get("query", "")
-    st.subheader(f"{preview_query} 여행지 먼저 살펴보기")
+    st.subheader(f"{preview_query} 여행지 먼저 살펴보기 · 6-35")
+    st.caption("마음에 드는 장소는 '가고 싶어요', 원하지 않는 장소는 '일정에서 제외'를 선택할 수 있습니다.")
     st.caption(f"여행 기간: {search_result.get('duration', '')} · 아직 날짜별 방문 순서와 동선은 정하지 않았습니다.")
     tour_data = (st.session_state.tourism_response or {}).get("places", [])
     food_data = (st.session_state.restaurant_response or {}).get("places", [])
     st.info("아래 목록은 외부 API가 반환한 검색 후보입니다. 영업 여부, 반려견 출입 가능 여부, 실제 이동 경로는 확인하지 않았습니다.")
     tab_tour, tab_food, tab_cafe = st.tabs(["관광지 후보", "식사 후보", "카페 후보"])
     with tab_tour:
-        _trip_634_preview_cards(tour_data, preview_query, "관광지")
+        _trip_635_preview_cards(tour_data, "관광지")
     with tab_food:
-        _trip_634_preview_cards(food_data, preview_query, "음식점")
+        _trip_635_preview_cards(food_data, "음식점")
     with tab_cafe:
         # 기존 음식점 API의 카페 분류만 표시합니다. 별도 카페 검색 결과가 없으면 비어 있을 수 있습니다.
         cafe_candidates = [p for p in food_data if any(w in str(p.get("category", "")) + " " + str(p.get("name", "")) for w in ("카페", "커피", "디저트", "베이커리"))]
-        _trip_634_preview_cards(cafe_candidates, preview_query, "카페")
+        _trip_635_preview_cards(cafe_candidates, "카페")
+    st.caption(f"가고 싶은 장소 {len(st.session_state.get('trip_635_favorites', []))}곳 · 제외할 장소 {len(st.session_state.get('trip_635_excluded', []))}곳")
+    st.caption("선호 장소는 추천 순위에 우선 반영하고, 제외 장소는 자동 일정 후보에서 제거합니다. 실제 일정 포함 여부는 운영시간·이동시간·후보 수 등에 따라 달라질 수 있습니다.")
     st.divider()
     _trip_634_personalize(search_result)
 
@@ -3486,6 +3525,11 @@ if search_result and search_result.get("trip_634_stage") != "preview":
     if selected_pet:
         ranked_attractions = _pet_prioritize(ranked_attractions)
         ranked_restaurants = _pet_prioritize(ranked_restaurants)
+
+    if search_result.get("trip_635_preference_enabled"):
+        ranked_attractions = _trip_635_rank_preferences(ranked_attractions)
+        ranked_restaurants = _trip_635_rank_preferences(ranked_restaurants)
+        st.caption("간단 검색에서 선택한 가고 싶은 장소·제외 장소 조건을 반영했습니다.")
 
     st.subheader(f"{query} 여행 일정")
     # 6-12: 여행 조건을 취소선처럼 보이는 한 줄 caption 대신 구분된 정보 칩으로 표시합니다.
