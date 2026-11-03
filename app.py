@@ -1609,10 +1609,109 @@ def render_trip_639_quality(itinerary: list, transport: str) -> None:
     st.caption("실제 식당 예약·운영시간, 반려견 동반 가능 여부는 직접 확인해야 합니다.")
 
 
+def _trip_640_integration_report(itinerary: list, search: dict, tourism: list, food: list,
+                                 favorites: list, excluded: list, selected_lodging: dict | None) -> list[dict]:
+    """Audit only what local session data can establish; never assert external availability."""
+    findings = []
+    def add(level: str, subject: str, detail: str) -> None:
+        findings.append({"level": level, "subject": subject, "detail": detail})
+
+    if not tourism:
+        add("warning", "관광지 검색", "관광지 API 후보가 없습니다. 검색 지역과 API 응답을 확인하세요.")
+    else:
+        add("ok", "관광지 검색", f"검색된 관광지 후보 {len(tourism)}곳")
+    if not food:
+        add("warning", "음식점 검색", "음식점 API 후보가 없습니다. 검색 지역과 API 응답을 확인하세요.")
+    else:
+        add("ok", "음식점 검색", f"검색된 음식점 후보 {len(food)}곳")
+
+    if not itinerary:
+        add("warning", "일정 생성", "생성된 일정이 없어 날짜별 배치 검증을 수행할 수 없습니다.")
+        return findings
+
+    days = duration_to_days(search.get("duration", "당일치기"))
+    if len(itinerary) != days or [day for day, _ in itinerary] != list(range(1, days + 1)):
+        add("error", "일정 일수", f"요청 {days}일 / 생성 {len(itinerary)}일. 날짜 번호와 일수를 확인하세요.")
+    else:
+        add("ok", "일정 일수", f"요청한 {days}일과 생성된 날짜 수가 일치합니다.")
+
+    active = [(day, a) for day, activities in itinerary for a in activities
+              if a.get("type") not in ("안내", "이동 참고")]
+    seen = set()
+    duplicates = []
+    for day, a in active:
+        identity = _place_identity(a)
+        if identity and identity in seen:
+            duplicates.append(str(a.get("name", "이름 없음")))
+        seen.add(identity)
+    if duplicates:
+        add("error", "장소 중복", "동일 장소가 중복 배치됨: " + ", ".join(list(dict.fromkeys(duplicates))[:10]))
+    else:
+        add("ok", "장소 중복", "일정 내 장소 식별자 중복이 발견되지 않았습니다.")
+
+    excluded_ids = set(excluded)
+    visible_candidates = list(tourism) + list(food)
+    excluded_places = { _place_identity(p): str(p.get("name", "")) for p in visible_candidates
+                        if _trip_635_place_id(p) in excluded_ids }
+    violations = sorted({excluded_places[_place_identity(a)] for _, a in active
+                         if _place_identity(a) in excluded_places})
+    if violations:
+        add("error", "제외 장소", "제외한 장소가 일정에 포함됨: " + ", ".join(violations[:10]))
+    else:
+        add("ok", "제외 장소", "현재 검색 후보 기준으로 제외 장소의 일정 포함이 발견되지 않았습니다.")
+
+    fav_ids = set(favorites) - excluded_ids
+    chosen = [p for p in visible_candidates if _trip_635_place_id(p) in fav_ids]
+    active_ids = {_place_identity(a) for _, a in active}
+    missing = list(dict.fromkeys(str(p.get("name", "")) for p in chosen
+                                 if _place_identity(p) not in active_ids))
+    if missing:
+        add("warning", "선호 장소", "일정에 미포함된 선호 장소: " + ", ".join(missing[:10]) + ". 아래 배치 결과의 사유를 확인하세요.")
+    elif chosen:
+        add("ok", "선호 장소", f"현재 검색 후보에서 선택한 장소 {len(chosen)}곳이 일정에 포함되었습니다.")
+
+    if days > 1 and search.get("lodging_query"):
+        if selected_lodging:
+            add("ok", "숙소 선택", "숙소 검색 결과에서 장소를 선택했습니다. 예약 상태와 체크인 규정은 확인되지 않았습니다.")
+        else:
+            add("warning", "숙소 선택", "숙소명을 입력했지만 검색된 숙소가 확정되지 않았습니다. 숙소 기준 동선을 보장할 수 없습니다.")
+    if search.get("child_ages"):
+        add("info", "자녀 조건", f"입력된 자녀 연령 {len(search['child_ages'])}명은 추천 순위 계산에 전달됩니다. 실제 입장 연령은 미검증입니다.")
+    if search.get("pet_enabled"):
+        add("info", "반려견 조건", "반려견 관련 후보를 우선하는 설정입니다. 개별 장소의 실제 출입 허용은 확인되지 않았습니다.")
+    add("info", "이동 및 영업 정보", "이동시간은 추정치이며 실제 도로 이동시간·영업시간·예약 가능 여부는 검증하지 않았습니다.")
+    return findings
+
+
+def render_trip_640_integration(itinerary: list, search: dict, tourism: list, food: list,
+                                selected_lodging: dict | None) -> None:
+    with st.expander("6-40 · 검색부터 일정까지 통합 검증", expanded=False):
+        st.caption("현재 검색 결과와 편집된 일정의 내부 일관성을 점검합니다. 외부 장소 정보의 정확성을 인증하는 기능은 아닙니다.")
+        report = _trip_640_integration_report(
+            itinerary, search, tourism, food,
+            st.session_state.get("trip_635_favorites", []),
+            st.session_state.get("trip_635_excluded", []), selected_lodging,
+        )
+        errors = sum(r["level"] == "error" for r in report)
+        warnings = sum(r["level"] == "warning" for r in report)
+        st.write(f"검증 결과: 오류 {errors}건 · 확인 필요 {warnings}건 · 전체 점검 {len(report)}건")
+        for item in report:
+            message = f"**{item['subject']}** — {item['detail']}"
+            if item["level"] == "error":
+                st.error(message)
+            elif item["level"] == "warning":
+                st.warning(message)
+            elif item["level"] == "info":
+                st.info(message)
+            else:
+                st.success(message)
+        st.caption("사용자가 일정을 편집하면 현재 일정 기준으로 다시 계산합니다.")
+
+
 def render_trip_dashboard(itinerary: list, transport: str, destination: str, duration: str) -> None:
     """6-28: Free, session-local dashboard synchronized to the current itinerary."""
     st.markdown("---")
-    st.subheader("여행 일정 통합 대시보드 · 6-39")
+    st.subheader("여행 일정 통합 대시보드 · 6-40")
     st.caption("현재 편집한 일정과 승인된 6-26 재조정안을 기준으로 표시합니다. 유료 AI API는 사용하지 않습니다.")
     if not itinerary:
         st.info("대시보드에 표시할 일정이 없습니다.")
@@ -3153,7 +3252,7 @@ def _chat_633_normalize(question: dict, raw: str) -> tuple[str | None, str]:
     if key in ("days", "child_count"):
         import re
         if key == "days":
-            match = re.fullmatch(r"(\\d+)\\s*박\\s*(\\d+)\\s*일", answer)
+            match = re.fullmatch(r"(\d+)\s*박\s*(\d+)\s*일", answer)
             if match:
                 nights, days = map(int, match.groups())
                 if days != nights + 1:
@@ -3175,7 +3274,7 @@ def _chat_633_normalize(question: dict, raw: str) -> tuple[str | None, str]:
         return str(number), ""
     if key in ("arrival", "departure", "middle_start", "middle_end"):
         import re
-        m = re.fullmatch(r"(오전|오후)?\\s*(\\d{1,2})(?:[:시](\\d{1,2}))?\\s*(?:분)?", answer)
+        m = re.fullmatch(r"(오전|오후)?\s*(\d{1,2})(?:[:시](\d{1,2}))?\s*(?:분)?", answer)
         if not m:
             return None, "시간은 '13:00', '오후 1시'처럼 입력해 주세요."
         period, hh, mm = m.groups()
@@ -3678,6 +3777,10 @@ if submitted:
     st.session_state.trip_search_version = st.session_state.get("trip_search_version", 0) + 1
     st.session_state.trip_635_favorites = []
     st.session_state.trip_635_excluded = []
+    st.session_state.trip_636_placement_report = []
+    st.session_state.trip_itinerary_version = None
+    st.session_state.trip_623_selected_lodging = None
+    st.session_state.trip_623_lodging_identity = ""
     st.session_state.trip_edit_search_results = []
     st.session_state.trip_edit_search_error = ""
     if not destination_query.strip():
@@ -3835,7 +3938,7 @@ if search_result and st.session_state.restaurant_region_candidates:
 
 if search_result and search_result.get("trip_634_stage") == "preview":
     preview_query = search_result.get("query", "")
-    st.subheader(f"{preview_query} 여행지 먼저 살펴보기 · 6-36")
+    st.subheader(f"{preview_query} 여행지 먼저 살펴보기 · 6-40")
     st.caption("마음에 드는 장소는 '가고 싶어요', 원하지 않는 장소는 '일정에서 제외'를 선택할 수 있습니다.")
     st.caption(f"여행 기간: {search_result.get('duration', '')} · 아직 날짜별 방문 순서와 동선은 정하지 않았습니다.")
     tour_data = (st.session_state.tourism_response or {}).get("places", [])
@@ -4037,6 +4140,12 @@ if search_result and search_result.get("trip_634_stage") != "preview":
         else:
             st.session_state["trip_624_checkin"] = 15.0
         render_trip_dashboard(location_itinerary, selected_transport, query, selected_duration)
+        render_trip_640_integration(
+            location_itinerary, search_result,
+            (st.session_state.tourism_response or {}).get("places", []),
+            (st.session_state.restaurant_response or {}).get("places", []),
+            selected_lodging,
+        )
         render_itinerary_map(location_itinerary)
         st.markdown("---")
         st.subheader("여행 일정 관리")
