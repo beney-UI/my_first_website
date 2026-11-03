@@ -1320,10 +1320,112 @@ def render_trip_inline_editor(itinerary: list, destination: str) -> None:
                             _trip_631_update_itinerary(itinerary, f"{day}일 차 방문 순서 변경")
 
 
+
+def _trip_637_time_minutes(clock_text: str) -> int | None:
+    """Parse HH:MM (including next-day hours), without guessing from labels."""
+    import re
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(clock_text).strip())
+    if not match:
+        return None
+    hh, mm = map(int, match.groups())
+    return hh * 60 + mm if 0 <= hh <= 47 and 0 <= mm < 60 else None
+
+
+def _trip_637_day_findings(itinerary: list, transport: str) -> list[dict]:
+    """Read the same scheduled rows used by the integrated dashboard."""
+    rows = _trip_628_dashboard_rows(itinerary, transport)
+    result = []
+    pace = st.session_state.get("trip_617_pace", "보통")
+    for day, activities in itinerary:
+        day_rows = [r for r in rows if r.get("일차") == f"{day}일 차"]
+        end_times = []
+        transfer = 0
+        for r in day_rows:
+            time_text = str(r.get("시간", ""))
+            if "–" in time_text:
+                end = _trip_637_time_minutes(time_text.split("–")[-1])
+                if end is not None:
+                    end_times.append(end)
+            if r.get("구분") == "이동 (추정)":
+                import re
+                m = re.search(r"(\d+)분", str(r.get("소요", "")))
+                if m:
+                    transfer += int(m.group(1))
+        finish = max(end_times) if end_times else None
+        departure = int(st.session_state.get("trip_618_departure", 15)) * 60 if day == itinerary[-1][0] else None
+        daily_end = int(st.session_state.get("trip_617_end", 20)) * 60
+        limit = departure if departure is not None else daily_end
+        alerts = []
+        if finish is not None and finish > limit:
+            alerts.append(f"설정된 종료 기준보다 {(finish-limit)}분 늦게 끝납니다.")
+        if transfer >= 120:
+            alerts.append(f"추정 이동시간 합계 {transfer}분: 동선 점검을 권장합니다.")
+        meals = sum(a.get("type") in ("식사", "점심 식사", "저녁 식사") for a in activities)
+        if not meals:
+            alerts.append("식사 장소가 없습니다.")
+        result.append({"day": day, "finish": finish, "limit": limit, "transfer": transfer,
+                       "alerts": alerts, "visits": sum(is_editable_visit(a) for a in activities)})
+    return result
+
+
+def _trip_637_reorder_attractions(activities: list, transport: str) -> list:
+    """Optional attraction-only reorder; preserve meals, cafes and manually edited stops."""
+    plan = deepcopy(activities)
+    slots = [i for i, a in enumerate(plan) if a.get("type") == "관광" and not a.get("manual_edit")]
+    if len(slots) < 2:
+        return plan
+    remaining = [plan[i] for i in slots]
+    previous = next((plan[i] for i in range(slots[0]-1, -1, -1) if is_editable_visit(plan[i])), None)
+    for idx in slots:
+        if previous is None:
+            choice = remaining.pop(0)
+        else:
+            choice = min(remaining, key=lambda a: _estimated_transfer_minutes(previous, a, transport)[0])
+            remaining.remove(choice)
+        plan[idx] = choice
+        previous = choice
+    return plan
+
+
+def render_trip_637_review(itinerary: list, transport: str) -> None:
+    st.markdown("#### 6-37 · 방문 순서 및 일정 과밀 점검")
+    st.caption("통합 대시보드 시간표를 기준으로 과밀 여부를 확인합니다. 이동시간은 추정이며 실제 교통·영업시간을 검증하지 않습니다.")
+    findings = _trip_637_day_findings(itinerary, transport)
+    for item in findings:
+        day = item["day"]
+        finish = _clock(item["finish"]) if item["finish"] is not None else "계산 불가"
+        st.markdown(f"**{day}일 차** · 방문지 {item['visits']}곳 · 예상 종료 {finish} · 추정 이동 합계 {item['transfer']}분")
+        if item["alerts"]:
+            for alert in item["alerts"]:
+                st.warning(alert)
+        else:
+            st.caption("현재 설정된 종료 시각과 간이 점검 기준에서 별도 경고가 없습니다.")
+    with st.expander("관광지 방문 순서 변경안 확인", expanded=False):
+        st.caption("식사·카페·직접 편집한 장소는 이동하지 않습니다. 관광지 순서만 추정 이동시간 기준으로 조정하며, 적용 전후를 확인할 수 있습니다.")
+        for day, activities in itinerary:
+            proposed = _trip_637_reorder_attractions(activities, transport)
+            before = [a.get("name", "") for a in activities if is_editable_visit(a)]
+            after = [a.get("name", "") for a in proposed if is_editable_visit(a)]
+            if before == after:
+                st.caption(f"{day}일 차: 변경할 관광지 순서가 없습니다.")
+                continue
+            st.write(f"**{day}일 차 변경 전:** " + " → ".join(before))
+            st.write(f"**{day}일 차 변경 후:** " + " → ".join(after))
+            if st.button(f"{day}일 차 관광지 순서 적용", key=f"trip_637_apply_{day}"):
+                updated = deepcopy(itinerary)
+                for i, (current_day, _) in enumerate(updated):
+                    if current_day == day:
+                        updated[i] = (day, proposed)
+                        break
+                st.session_state["trip_624_visit_states"] = {}
+                _trip_631_update_itinerary(updated, f"{day}일 차 관광지 순서를 변경했습니다. 방문 진행 상태는 초기화했습니다.")
+    st.caption("순서 변경은 선택 사항입니다. 장소의 방문 가능 시간, 실제 도로 이동시간, 예약 여부는 별도로 확인하세요.")
+
+
 def render_trip_dashboard(itinerary: list, transport: str, destination: str, duration: str) -> None:
     """6-28: Free, session-local dashboard synchronized to the current itinerary."""
     st.markdown("---")
-    st.subheader("여행 일정 통합 대시보드 · 6-31")
+    st.subheader("여행 일정 통합 대시보드 · 6-37")
     st.caption("현재 편집한 일정과 승인된 6-26 재조정안을 기준으로 표시합니다. 유료 AI API는 사용하지 않습니다.")
     if not itinerary:
         st.info("대시보드에 표시할 일정이 없습니다.")
@@ -1393,6 +1495,7 @@ def render_trip_dashboard(itinerary: list, transport: str, destination: str, dur
                        key="trip_628_csv", use_container_width=True)
     st.caption("다운로드한 CSV 파일은 이후 일정 변경 시 자동 갱신되지 않습니다. 변경 후 다시 다운로드하세요. 브라우저 세션 종료 시 진행 상태가 사라질 수 있습니다.")
     render_trip_inline_editor(itinerary, destination)
+    render_trip_637_review(itinerary, transport)
     with st.expander("통합 일정 검수 · 시간 초과 / 중복 / 이동거리", expanded=False):
         st.caption("현재 통합 대시보드 일정 전체를 기준으로 검수합니다. 수정 후 다시 검수할 수 있습니다.")
         render_integrity_audit(itinerary, transport)
