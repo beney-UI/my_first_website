@@ -2972,9 +2972,121 @@ def _chat_633_summary(answers: dict) -> list[tuple[str, str]]:
     return labels
 
 
+# 6-34: 첫 문장에서 지역과 여행 기간만 추출합니다. 나머지는 검색 결과를 본 뒤 질문합니다.
+def _trip_634_parse_query(raw: str) -> tuple[dict | None, str]:
+    import re
+    text = " ".join(raw.strip().split())
+    if not text:
+        return None, "여행지와 기간을 입력해 주세요. 예: 강원도 속초 2박 3일"
+    m = re.search(r"(\d+)\s*박\s*(\d+)\s*일", text)
+    if m:
+        nights, days = map(int, m.groups())
+        if days != nights + 1:
+            return None, "숙박 일수와 여행 일수가 일치하지 않습니다. 예: 2박 3일"
+        text = text[:m.start()] + " " + text[m.end():]
+    elif re.search(r"당일\s*치기|당일\s*여행", text):
+        days = 1
+        text = re.sub(r"당일\s*치기|당일\s*여행", " ", text)
+    else:
+        m = re.search(r"(\d+)\s*일(?:\s*동안)?", text)
+        if not m:
+            return None, "여행 기간을 확인할 수 없습니다. '속초 2박 3일'처럼 입력해 주세요."
+        days = int(m.group(1))
+        text = text[:m.start()] + " " + text[m.end():]
+    if not 1 <= days <= MAX_TRAVEL_DAYS:
+        return None, f"여행 기간은 1~{MAX_TRAVEL_DAYS}일만 지원합니다."
+    text = re.sub(r"(?:여행|놀러|갈\s*거야|갈거야|가려고|가고\s*싶어|갑니다|갈래|다녀올\s*거야|다녀올거야|계획이야|으로|로|에|에서|가자|갈게)", " ", text)
+    text = " ".join(text.split()).strip()
+    if not text:
+        return None, "여행 지역을 확인할 수 없습니다. 예: 속초 2박 3일"
+    # '강원도 속초'는 정확한 검색 지명 '속초'로, 광역시/도만 있다면 그대로 사용
+    pieces = text.split()
+    if len(pieces) >= 2 and pieces[0].endswith(("도", "특별자치도", "광역시", "특별시")):
+        text = " ".join(pieces[1:])
+    return {"destination": text, "days": days}, ""
+
+
+def _trip_634_preview_cards(places: list, city: str, section: str, limit: int = 12) -> None:
+    if not places:
+        st.info(f"{section} 검색 결과가 없습니다. 외부 API 설정이나 검색 범위를 확인해 주세요.")
+        return
+    for place in places[:limit]:
+        name = str(place.get("name") or "이름 없음")
+        address = str(place.get("address") or place.get("road_address") or "주소 정보 없음")
+        category = str(place.get("category") or "")
+        st.markdown(f"**{escape(name)}**")
+        st.caption(" · ".join(x for x in (address, category) if x))
+        link = place.get("url") or place.get("place_url")
+        if isinstance(link, str) and link.startswith(("https://", "http://")):
+            st.markdown(f"[장소 정보 확인]({link})")
+        st.divider()
+    if len(places) > limit:
+        st.caption(f"전체 {len(places)}곳 중 {limit}곳만 미리 보여줍니다.")
+
+
+def _trip_634_personalize(search: dict) -> None:
+    st.markdown("### 이제 여행 일정을 맞춰볼까요?")
+    st.write("먼저 찾은 여행지 후보를 바탕으로, 해당하는 조건만 추가해 일정을 만듭니다.")
+    days = duration_to_days(search.get("duration", "1박 2일"))
+    with st.form("trip_634_personalize_form"):
+        has_lodging = False
+        lodging = ""
+        if days > 1:
+            has_lodging = st.radio("숙소는 이미 정하셨나요?", ["아직 정하지 않았어요", "네, 정했어요"], horizontal=True) == "네, 정했어요"
+            if has_lodging:
+                lodging = st.text_input("숙소명 또는 주소", placeholder="예: 속초 ○○호텔")
+        party = st.selectbox("누구와 함께 가시나요?", TRAVEL_PARTIES, index=2)
+        children = st.radio("자녀도 함께 가나요?", ["아니요", "네"], horizontal=True)
+        child_ages = []
+        if children == "네":
+            count = st.number_input("자녀 수", min_value=1, max_value=10, value=1, step=1)
+            for i in range(int(count)):
+                child_ages.append(st.selectbox(f"자녀 {i+1} 연령", CHILD_AGE_OPTIONS, key=f"trip_634_age_{i}"))
+        pet = st.radio("반려견도 함께 가나요?", ["아니요", "네"], horizontal=True)
+        transport = st.selectbox("어떤 교통수단을 이용하시나요?", TRANSPORT_MODES)
+        primary = st.selectbox("어떤 여행을 선호하시나요?", STYLE_NAMES)
+        pace = st.selectbox("일정은 어느 정도 여유롭게 구성할까요?", ["여유롭게", "보통", "빠르게"], index=1)
+        arrival = st.selectbox("첫날 여행지 도착 시각", list(range(7, 23)), index=6, format_func=lambda x: f"{x:02d}:00")
+        departure = st.selectbox("마지막 날 귀가 출발 시각", list(range(8, 24)), index=7, format_func=lambda x: f"{x:02d}:00")
+        if days > 2:
+            middle_start = st.selectbox("중간 날짜 출발 시각", list(range(7, 13)), index=2, format_func=lambda x: f"{x:02d}:00")
+            middle_end = st.selectbox("중간 날짜 종료 시각", list(range(16, 24)), index=4, format_func=lambda x: f"{x:02d}:00")
+        else:
+            middle_start, middle_end = 9, 20
+        ready = st.form_submit_button("이 조건으로 맞춤 여행 일정 만들기", type="primary", use_container_width=True)
+    if not ready:
+        return
+    if has_lodging and not lodging.strip():
+        st.warning("숙소를 정했다고 선택했다면 숙소명 또는 주소를 입력해 주세요.")
+        return
+    child_groups = list(dict.fromkeys(child_age_bucket(age) for age in child_ages))
+    child_group = ", ".join(child_groups) if child_groups else None
+    search.update({
+        "party": party, "companion": companion_for_media(party, child_group),
+        "child_group": child_group, "child_ages": child_ages,
+        "child_age": child_groups[0] if len(child_groups) == 1 else None,
+        "pet_enabled": pet == "네", "transport": transport,
+        "travel_style": primary, "lodging_query": lodging.strip(),
+        "trip_634_stage": "itinerary",
+    })
+    st.session_state["trip_617_pace"] = pace
+    st.session_state["trip_618_arrival"] = arrival
+    st.session_state["trip_618_departure"] = departure
+    st.session_state["trip_617_start"] = middle_start
+    st.session_state["trip_617_end"] = middle_end
+    st.session_state.setdefault("trip_624_checkin", 15.0)
+    st.session_state.setdefault("trip_624_checkout", 11)
+    st.session_state.search_result = search
+    st.session_state.trip_search_version = st.session_state.get("trip_search_version", 0) + 1
+    st.session_state.trip_itinerary_version = None
+    st.rerun()
+
+
 # 화면 모드는 전환해도 검색 결과를 삭제하지 않습니다.
-st.session_state.setdefault("trip_632_mode", "대화형 검색")
-search_mode = st.radio("검색 방식", ["대화형 검색","기존 상세 검색"], horizontal=True, key="trip_632_mode")
+st.session_state.setdefault("trip_632_mode", "간단 검색")
+if st.session_state.trip_632_mode not in ("간단 검색", "기존 상세 검색"):
+    st.session_state.trip_632_mode = "간단 검색"
+search_mode = st.radio("검색 방식", ["간단 검색", "기존 상세 검색"], horizontal=True, key="trip_632_mode")
 
 # 기존 검색 엔진에서 사용하는 입력 변수 기본값
 submitted=False
@@ -3104,86 +3216,23 @@ if search_mode == "기존 상세 검색":
         child_age = child_groups[0] if len(child_groups) == 1 else None
         submitted = st.button("여행지 검색", type="primary", use_container_width=True)
 else:
-    st.session_state.setdefault("trip_632_answers", {})
-    answers=st.session_state.trip_632_answers
-    questions=_chat_632_questions(answers)
-    st.markdown("#### 대화형 여행 플래너 · 6-33")
-    st.caption("선택 버튼이나 간단한 자연어로 답변하세요. 이전 답변에 따라 자녀·숙소 질문이 달라집니다. 유료 AI API는 사용하지 않습니다.")
-    st.progress(min(1.0,len(answers)/max(1,len(questions))))
-    for item in questions:
-        if item["key"] not in answers: break
-        with st.chat_message("assistant"):
-            st.write(item["prompt"])
-        with st.chat_message("user"):
-            st.write(answers[item["key"]])
-    current=next((q for q in questions if q["key"] not in answers),None)
-    if current:
-        with st.chat_message("assistant"):
-            st.write(current["prompt"])
-            if current.get("hint"): st.caption(current["hint"])
-        with st.form("trip_632_question_form",clear_on_submit=True):
-            options=current["options"]
-            if options:
-                choice=st.selectbox("추천 답변",["직접 입력"]+options,key=f"trip_632_choice_{current['key']}")
-            else: choice="직접 입력"
-            typed=st.text_input("직접 입력" if choice=="직접 입력" else "다른 답변 입력 (선택)",
-                                key=f"trip_632_text_{current['key']}")
-            next_clicked=st.form_submit_button("답변하고 다음 질문",type="primary",use_container_width=True)
-        if next_clicked:
-            raw=typed if typed.strip() else (choice if choice!="직접 입력" else "")
-            normalized,error=_chat_632_validate(current,raw)
-            if error: st.warning(error)
-            else:
-                answers[current["key"]]=normalized
-                st.session_state.trip_632_answers=answers
-                st.rerun()
-    else:
-        st.success("여행 조건이 완성됐습니다. 확인 후 여행 일정을 생성하세요.")
-        st.markdown("**여행 조건 최종 확인**")
-        summary_rows = _chat_633_summary(answers)
-        for label, value in summary_rows:
-            left, right = st.columns([1, 2])
-            left.caption(label)
-            right.write(value)
-        st.caption("잘못 입력한 조건이 있다면 '이전 질문'으로 돌아가 수정하거나 대화를 다시 시작하세요.")
-        submitted=st.button("이 조건으로 여행 일정 만들기",type="primary",use_container_width=True)
-    back_col,reset_col=st.columns(2)
-    with back_col:
-        if st.button("이전 질문",disabled=not bool(answers),use_container_width=True):
-            last=next((q["key"] for q in reversed(questions) if q["key"] in answers),None)
-            if last:
-                # Backtracking clears the last answer and any conditional descendants.
-                old_order=[q["key"] for q in questions]
-                cut=old_order.index(last)
-                st.session_state.trip_632_answers={k:v for k,v in answers.items() if k in old_order[:cut]}
-                st.rerun()
-    with reset_col:
-        if st.button("대화 처음부터",use_container_width=True):
-            st.session_state.trip_632_answers={}
-            st.rerun()
-    if submitted:
-        destination_query=answers["destination"]
-        party=answers["party"]
-        travel_days=int(answers["days"])
-        duration=days_to_duration(travel_days)
-        transport=answers["transport"]
-        primary=answers["primary"]; secondary=answers["secondary"]
-        travel_style=primary if secondary in ("선택 안 함",primary) else primary+" + "+secondary
-        child_ages=[answers[f"age_{i}"] for i in range(int(answers.get("child_count",0)))] if answers["children"]=="예" else []
-        pet_enabled=answers["pet"]=="예"
-        lodging_query_input=answers.get("lodging","")
-        if lodging_query_input=="아직 정하지 않았어요": lodging_query_input=""
-        st.session_state["trip_617_pace"]=answers["pace"]
-        st.session_state["trip_618_arrival"]=int(answers["arrival"].split(":")[0])
-        st.session_state["trip_618_departure"]=int(answers["departure"].split(":")[0])
-        st.session_state["trip_617_start"]=int(answers.get("middle_start","09:00").split(":")[0])
-        st.session_state["trip_617_end"]=int(answers.get("middle_end","20:00").split(":")[0])
-        st.session_state.setdefault("trip_624_checkin",15.0)
-        st.session_state.setdefault("trip_624_checkout",11)
-        child_groups=list(dict.fromkeys(child_age_bucket(age) for age in child_ages))
-        child_group=", ".join(child_groups) if child_groups else None
-        child_age=child_groups[0] if len(child_groups)==1 else None
-        companion=companion_for_media(party,child_group)
+    st.markdown("### 여행을 한 문장으로 검색해 보세요")
+    st.caption("예: 강원도 속초 여행 2박 3일 갈 거야 · 부산 당일치기 · 제주도 3일 여행")
+    with st.form("trip_634_quick_search", clear_on_submit=False):
+        quick_text = st.text_input("여행 검색", placeholder="강원도 속초 여행 2박 3일 갈 거야", key="trip_634_query")
+        quick_clicked = st.form_submit_button("여행지 먼저 찾아보기", type="primary", use_container_width=True)
+    if quick_clicked:
+        parsed, parse_error = _trip_634_parse_query(quick_text)
+        if parse_error:
+            st.warning(parse_error)
+        else:
+            destination_query = parsed["destination"]
+            travel_days = parsed["days"]
+            duration = days_to_duration(travel_days)
+            party = "연인·친구와 여행"  # 검색 전 동행 정보가 없으므로 개인화에 사용하지 않음
+            companion = companion_for_media(party, None)
+            st.session_state.trip_634_preview_requested = True
+            submitted = True
 
 if "search_result" not in st.session_state:
     st.session_state.search_result = None
@@ -3223,6 +3272,7 @@ if submitted:
         query = destination_query.strip()
         pending_search = {
             "query": query,
+            "trip_634_stage": "preview" if search_mode == "간단 검색" else "itinerary",
             "companion": companion,
             "party": party,
             "child_group": child_group,
@@ -3361,7 +3411,26 @@ if search_result and st.session_state.restaurant_region_candidates:
         )
         st.session_state.selected_kakao_region = selected_region
 
-if search_result:
+if search_result and search_result.get("trip_634_stage") == "preview":
+    preview_query = search_result.get("query", "")
+    st.subheader(f"{preview_query} 여행지 먼저 살펴보기")
+    st.caption(f"여행 기간: {search_result.get('duration', '')} · 아직 날짜별 방문 순서와 동선은 정하지 않았습니다.")
+    tour_data = (st.session_state.tourism_response or {}).get("places", [])
+    food_data = (st.session_state.restaurant_response or {}).get("places", [])
+    st.info("아래 목록은 외부 API가 반환한 검색 후보입니다. 영업 여부, 반려견 출입 가능 여부, 실제 이동 경로는 확인하지 않았습니다.")
+    tab_tour, tab_food, tab_cafe = st.tabs(["관광지 후보", "식사 후보", "카페 후보"])
+    with tab_tour:
+        _trip_634_preview_cards(tour_data, preview_query, "관광지")
+    with tab_food:
+        _trip_634_preview_cards(food_data, preview_query, "음식점")
+    with tab_cafe:
+        # 기존 음식점 API의 카페 분류만 표시합니다. 별도 카페 검색 결과가 없으면 비어 있을 수 있습니다.
+        cafe_candidates = [p for p in food_data if any(w in str(p.get("category", "")) + " " + str(p.get("name", "")) for w in ("카페", "커피", "디저트", "베이커리"))]
+        _trip_634_preview_cards(cafe_candidates, preview_query, "카페")
+    st.divider()
+    _trip_634_personalize(search_result)
+
+if search_result and search_result.get("trip_634_stage") != "preview":
     query = search_result.get("query", "")
     selected_companion = search_result.get("companion", COMPANIONS[0])
     selected_duration = search_result.get("duration", TRAVEL_DURATIONS[0])
