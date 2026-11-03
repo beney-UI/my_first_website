@@ -2822,7 +2822,7 @@ def _chat_632_questions(values: dict) -> list[dict]:
     questions = [
         {"key":"destination", "prompt":"어디로 여행을 떠나실 계획인가요?", "options":[], "hint":"지역 또는 관광지 이름을 직접 입력하세요. 예: 강릉, 제주 애월읍"},
         {"key":"party", "prompt":"누구와 여행하시나요?", "options":list(TRAVEL_PARTIES)},
-        {"key":"days", "prompt":"여행은 며칠 동안 하시나요?", "options":["1", "2", "3", "4", "5"], "hint":"1~30 사이의 숫자 입력 가능"},
+        {"key":"days", "prompt":"여행은 며칠 동안 하시나요?", "options":["1", "2", "3", "4", "5"], "hint":"예: 2박 3일, 3일, 당일치기"},
         {"key":"transport", "prompt":"어떤 이동 수단을 이용하시나요?", "options":list(TRANSPORT_MODES)},
         {"key":"primary", "prompt":"가장 선호하는 여행 스타일은 무엇인가요?", "options":list(STYLE_NAMES)},
         {"key":"secondary", "prompt":"보조 여행 스타일도 선택할까요?", "options":["선택 안 함"]+list(STYLE_NAMES)},
@@ -2838,7 +2838,7 @@ def _chat_632_questions(values: dict) -> list[dict]:
         for idx in range(count):
             questions.append({"key":f"age_{idx}", "prompt":f"자녀 {idx+1}의 연령대는 어떻게 되나요?", "options":list(CHILD_AGE_OPTIONS)})
     questions.append({"key":"pet", "prompt":"반려견도 함께 여행하나요?", "options":["아니요", "예"]})
-    questions.append({"key":"arrival", "prompt":"첫날 여행지에는 몇 시쯤 도착하시나요?", "options":["09:00","11:00","13:00","15:00","17:00"], "hint":"07:00~22:00 사이 정시 입력"})
+    questions.append({"key":"arrival", "prompt":"첫날 여행지에는 몇 시쯤 도착하시나요?", "options":["09:00","11:00","13:00","15:00","17:00"], "hint":"예: 13:00 또는 오후 1시 (정시만 지원)"})
     questions.append({"key":"departure", "prompt":"마지막 날 귀가를 위해 몇 시에 출발하시나요?", "options":["11:00","13:00","15:00","17:00","19:00"], "hint":"08:00~23:00 사이 정시 입력"})
     if int(values.get("days",1) or 1)>2:
         questions.append({"key":"middle_start", "prompt":"중간 날짜에는 숙소에서 몇 시에 출발할까요?", "options":["08:00","09:00","10:00","11:00"], "hint":"07:00~12:00 사이 정시 입력"})
@@ -2848,30 +2848,128 @@ def _chat_632_questions(values: dict) -> list[dict]:
     return questions
 
 
-def _chat_632_validate(question: dict, raw: str) -> tuple[str|None,str]:
-    key=question["key"]
-    answer=raw.strip()
-    if key=="destination":
-        return (answer,None) if answer else (None,"여행지 이름을 입력해 주세요.")
-    if key in ("days","child_count"):
-        try: number=int(answer.replace("일","").replace("명",""))
-        except ValueError: return None,"숫자로 입력해 주세요."
-        limit=MAX_TRAVEL_DAYS if key=="days" else 10
-        if not 1<=number<=limit: return None,f"1~{limit} 사이로 입력해 주세요."
-        return str(number),""
-    if key in ("arrival","departure","middle_start","middle_end"):
+def _chat_633_normalize(question: dict, raw: str) -> tuple[str | None, str]:
+    """Recognize a small, explicit set of Korean synonyms without a paid LLM.
+
+    Unsupported free-form phrases are rejected rather than guessed.
+    """
+    key = question["key"]
+    answer = raw.strip()
+    compact = "".join(answer.lower().split())
+    if key == "destination":
+        return (answer, "") if answer else (None, "여행지 이름을 입력해 주세요.")
+    if key in ("days", "child_count"):
+        import re
+        if key == "days":
+            match = re.fullmatch(r"(\\d+)\\s*박\\s*(\\d+)\\s*일", answer)
+            if match:
+                nights, days = map(int, match.groups())
+                if days != nights + 1:
+                    return None, "숙박 일수와 여행 일수가 일치하지 않습니다. 예: 2박 3일"
+                answer = str(days)
+            elif compact in ("당일치기", "당일여행", "하루"):
+                answer = "1"
+            else:
+                answer = answer.replace("일", "").replace("동안", "").strip()
+        else:
+            answer = answer.replace("명", "").replace("아이", "").strip()
         try:
-            hour=int(answer.split(":")[0]); minute=int(answer.split(":")[1]) if ":" in answer else 0
-        except (ValueError,IndexError): return None,"예: 13:00 형식으로 입력해 주세요."
-        bounds={"arrival":(7,22),"departure":(8,23),"middle_start":(7,12),"middle_end":(16,23)}
-        low,high=bounds[key]
-        if not(low<=hour<=high and minute==0): return None,f"{low:02d}:00~{high:02d}:00 범위에서 정시로 입력해 주세요."
-        return f"{hour:02d}:00",""
-    if key=="lodging":
-        return answer or "아직 정하지 않았어요",""
-    if answer not in question["options"]:
-        return None,"제시된 선택지 중 하나를 선택해 주세요. 자유 입력은 여행지·일수·시간·숙소에 사용할 수 있습니다."
-    return answer,""
+            number = int(answer)
+        except ValueError:
+            return None, "여행 기간은 '2박 3일', '3일'처럼, 자녀 수는 '2명'처럼 입력해 주세요."
+        limit = MAX_TRAVEL_DAYS if key == "days" else 10
+        if not 1 <= number <= limit:
+            return None, f"1~{limit} 사이로 입력해 주세요."
+        return str(number), ""
+    if key in ("arrival", "departure", "middle_start", "middle_end"):
+        import re
+        m = re.fullmatch(r"(오전|오후)?\\s*(\\d{1,2})(?:[:시](\\d{1,2}))?\\s*(?:분)?", answer)
+        if not m:
+            return None, "시간은 '13:00', '오후 1시'처럼 입력해 주세요."
+        period, hh, mm = m.groups()
+        hour, minute = int(hh), int(mm or 0)
+        if period and not 1 <= hour <= 12:
+            return None, "오전/오후는 1~12시로 입력해 주세요."
+        if period == "오후" and hour < 12:
+            hour += 12
+        if period == "오전" and hour == 12:
+            hour = 0
+        bounds = {"arrival": (7, 22), "departure": (8, 23),
+                  "middle_start": (7, 12), "middle_end": (16, 23)}
+        low, high = bounds[key]
+        if not (low <= hour <= high and minute == 0):
+            return None, f"{low:02d}:00~{high:02d}:00 범위에서 정시로 입력해 주세요."
+        return f"{hour:02d}:00", ""
+    if key == "lodging":
+        if not answer or compact in ("없음", "미정", "아직", "아직안정했어요", "아직정하지않았어요"):
+            return "아직 정하지 않았어요", ""
+        return answer, ""
+    if answer in question["options"]:
+        return answer, ""
+    aliases = {
+        "party": {
+            "혼자": "혼자 여행", "나혼자": "혼자 여행", "솔로": "혼자 여행",
+            "친구": "연인·친구와 여행", "친구랑": "연인·친구와 여행",
+            "연인": "연인·친구와 여행", "커플": "연인·친구와 여행",
+            "가족": "우리 가족 여행", "가족여행": "우리 가족 여행",
+            "부모님": "부모님과 여행", "부모님과": "부모님과 여행",
+            "3대": "3대 가족 여행", "삼대": "3대 가족 여행",
+        },
+        "transport": {
+            "자차": "자차", "자동차": "자차", "차": "자차", "렌터카": "자차",
+            "대중교통": "대중교통", "버스": "대중교통", "기차": "대중교통",
+        },
+        "primary": {"관광": "관광 중심", "휴식": "휴식 중심",
+                    "맛집": "맛집 중심", "체험": "체험 중심"},
+        "secondary": {"없음": "선택 안 함", "안함": "선택 안 함",
+                      "괜찮아요": "선택 안 함", "관광": "관광 중심",
+                      "휴식": "휴식 중심", "맛집": "맛집 중심", "체험": "체험 중심"},
+        "pace": {"느긋하게": "여유롭게", "천천히": "여유롭게",
+                 "여유": "여유롭게", "적당히": "보통",
+                 "빡빡하게": "빠르게", "알차게": "빠르게"},
+        "children": {"네": "예", "있어요": "예", "동반": "예",
+                     "아니오": "아니요", "없어요": "아니요", "없음": "아니요"},
+        "pet": {"네": "예", "있어요": "예", "동반": "예",
+                "아니오": "아니요", "없어요": "아니요", "없음": "아니요"},
+    }
+    mapped = aliases.get(key, {}).get(compact)
+    if mapped in question["options"]:
+        return mapped, ""
+    return None, "입력을 이해하지 못했습니다. 아래 선택지를 선택하거나 안내된 형식으로 입력해 주세요."
+
+
+def _chat_632_validate(question: dict, raw: str) -> tuple[str | None, str]:
+    return _chat_633_normalize(question, raw)
+
+
+def _chat_633_summary(answers: dict) -> list[tuple[str, str]]:
+    labels = [
+        ("여행지", answers.get("destination", "")),
+        ("동행", answers.get("party", "")),
+        ("여행 기간", f"{answers.get('days', '1')}일"),
+        ("이동수단", answers.get("transport", "")),
+        ("주요 스타일", answers.get("primary", "")),
+        ("보조 스타일", answers.get("secondary", "")),
+        ("여행 속도", answers.get("pace", "")),
+        ("자녀 동반", "예" if answers.get("children") == "예" else "아니요"),
+    ]
+    if answers.get("children") == "예":
+        labels.append(("자녀 수", f"{answers.get('child_count', '0')}명"))
+        for i in range(int(answers.get("child_count", 0))):
+            labels.append((f"자녀 {i + 1} 연령", answers.get(f"age_{i}", "")))
+    labels.extend([
+        ("반려견 동반", answers.get("pet", "")),
+        ("첫날 도착", answers.get("arrival", "")),
+        ("마지막 날 출발", answers.get("departure", "")),
+    ])
+    if int(answers.get("days", 1)) > 2:
+        labels.extend([
+            ("중간 날짜 출발", answers.get("middle_start", "")),
+            ("중간 날짜 종료", answers.get("middle_end", "")),
+        ])
+    if int(answers.get("days", 1)) > 1:
+        labels.append(("숙소", answers.get("lodging", "")))
+    return labels
 
 
 # 화면 모드는 전환해도 검색 결과를 삭제하지 않습니다.
@@ -3009,8 +3107,8 @@ else:
     st.session_state.setdefault("trip_632_answers", {})
     answers=st.session_state.trip_632_answers
     questions=_chat_632_questions(answers)
-    st.markdown("#### 대화형 여행 플래너")
-    st.caption("질문에 답하거나 직접 입력해 여행 조건을 완성하세요. 유료 AI API는 사용하지 않습니다.")
+    st.markdown("#### 대화형 여행 플래너 · 6-33")
+    st.caption("선택 버튼이나 간단한 자연어로 답변하세요. 이전 답변에 따라 자녀·숙소 질문이 달라집니다. 유료 AI API는 사용하지 않습니다.")
     st.progress(min(1.0,len(answers)/max(1,len(questions))))
     for item in questions:
         if item["key"] not in answers: break
@@ -3041,7 +3139,13 @@ else:
                 st.rerun()
     else:
         st.success("여행 조건이 완성됐습니다. 확인 후 여행 일정을 생성하세요.")
-        st.json({q["prompt"]:answers[q["key"]] for q in questions},expanded=False)
+        st.markdown("**여행 조건 최종 확인**")
+        summary_rows = _chat_633_summary(answers)
+        for label, value in summary_rows:
+            left, right = st.columns([1, 2])
+            left.caption(label)
+            right.write(value)
+        st.caption("잘못 입력한 조건이 있다면 '이전 질문'으로 돌아가 수정하거나 대화를 다시 시작하세요.")
         submitted=st.button("이 조건으로 여행 일정 만들기",type="primary",use_container_width=True)
     back_col,reset_col=st.columns(2)
     with back_col:
