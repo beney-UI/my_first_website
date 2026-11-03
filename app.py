@@ -2816,123 +2816,270 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# PC에서는 3열 × 2행 균등 배열, 모바일에서는 한 열로 표시합니다.
-# 자녀 동반 여부는 여행 동행 유형과 무관하게 독립적으로 선택합니다.
-with st.container():
-    row1_destination, row1_party, row1_days = st.columns(3, gap="medium")
-    with row1_destination:
-        destination_query = st.text_input(
-            "여행지",
-            placeholder="예: 서울, 경기 용인시, 제주 애월읍, 불국사",
-            help="지역명이나 관광지명을 입력하면 TourAPI와 카카오 로컬 API에서 검색합니다.",
-        )
-    with row1_party:
-        party = st.selectbox("누구와 여행하나요?", TRAVEL_PARTIES)
-    with row1_days:
-        travel_days = st.number_input(
-            "여행 일수 (직접 선택)",
-            min_value=1,
-            max_value=MAX_TRAVEL_DAYS,
-            value=2,
-            step=1,
-            help="1~30일 중 선택하세요. 1일은 당일치기, 5일은 4박 5일로 표시됩니다.",
-        )
-        duration = days_to_duration(int(travel_days))
+# 6-32: 대화형 검색은 별도의 유료 LLM 호출 없이 명시적인 조건 수집으로 작동합니다.
+# 기존 6-31의 검색/일정 생성 엔진을 그대로 호출합니다.
+def _chat_632_questions(values: dict) -> list[dict]:
+    questions = [
+        {"key":"destination", "prompt":"어디로 여행을 떠나실 계획인가요?", "options":[], "hint":"지역 또는 관광지 이름을 직접 입력하세요. 예: 강릉, 제주 애월읍"},
+        {"key":"party", "prompt":"누구와 여행하시나요?", "options":list(TRAVEL_PARTIES)},
+        {"key":"days", "prompt":"여행은 며칠 동안 하시나요?", "options":["1", "2", "3", "4", "5"], "hint":"1~30 사이의 숫자 입력 가능"},
+        {"key":"transport", "prompt":"어떤 이동 수단을 이용하시나요?", "options":list(TRANSPORT_MODES)},
+        {"key":"primary", "prompt":"가장 선호하는 여행 스타일은 무엇인가요?", "options":list(STYLE_NAMES)},
+        {"key":"secondary", "prompt":"보조 여행 스타일도 선택할까요?", "options":["선택 안 함"]+list(STYLE_NAMES)},
+        {"key":"pace", "prompt":"여행 속도는 어떻게 할까요?", "options":["여유롭게", "보통", "빠르게"]},
+        {"key":"children", "prompt":"자녀와 함께 여행하시나요?", "options":["아니요", "예"]},
+    ]
+    if values.get("children") == "예":
+        questions.append({"key":"child_count", "prompt":"함께 가는 자녀는 몇 명인가요?", "options":["1", "2", "3"], "hint":"1~10명 입력 가능"})
+        try:
+            count = min(10,max(1,int(values.get("child_count",0))))
+        except (TypeError,ValueError):
+            count = 0
+        for idx in range(count):
+            questions.append({"key":f"age_{idx}", "prompt":f"자녀 {idx+1}의 연령대는 어떻게 되나요?", "options":list(CHILD_AGE_OPTIONS)})
+    questions.append({"key":"pet", "prompt":"반려견도 함께 여행하나요?", "options":["아니요", "예"]})
+    questions.append({"key":"arrival", "prompt":"첫날 여행지에는 몇 시쯤 도착하시나요?", "options":["09:00","11:00","13:00","15:00","17:00"], "hint":"07:00~22:00 사이 정시 입력"})
+    questions.append({"key":"departure", "prompt":"마지막 날 귀가를 위해 몇 시에 출발하시나요?", "options":["11:00","13:00","15:00","17:00","19:00"], "hint":"08:00~23:00 사이 정시 입력"})
+    if int(values.get("days",1) or 1)>2:
+        questions.append({"key":"middle_start", "prompt":"중간 날짜에는 숙소에서 몇 시에 출발할까요?", "options":["08:00","09:00","10:00","11:00"], "hint":"07:00~12:00 사이 정시 입력"})
+        questions.append({"key":"middle_end", "prompt":"중간 날짜에는 몇 시까지 여행할까요?", "options":["17:00","18:00","19:00","20:00","21:00"], "hint":"16:00~23:00 사이 정시 입력"})
+    if int(values.get("days",1) or 1)>1:
+        questions.append({"key":"lodging", "prompt":"예약한 숙소가 있나요? 있다면 숙소명이나 주소를 입력해 주세요.", "options":["아직 정하지 않았어요"], "hint":"숙소명·주소 직접 입력 가능"})
+    return questions
 
-    # 6-30: 여행 시간 조건은 여행지 검색 전에 한 번만 설정합니다.
-    row2_transport, row2_style, row2_child = st.columns(3, gap="medium")
-    with row2_transport:
-        transport = st.selectbox("이동 수단", TRANSPORT_MODES)
-    with row2_style:
-        travel_style_primary = st.selectbox("주요 여행 스타일", STYLE_NAMES, key="trip_style_primary_v614")
-        travel_style_secondary = st.selectbox(
-            "보조 여행 스타일 (선택)",
-            ("선택 안 함",) + tuple(s for s in STYLE_NAMES if s != travel_style_primary),
-            key="trip_style_secondary_v614",
-            help="선택하지 않으면 기존 단일 스타일로 일정이 만들어집니다.",
-        )
-        travel_style = (travel_style_primary if travel_style_secondary == "선택 안 함"
-                        else travel_style_primary + " + " + travel_style_secondary)
-    with row2_child:
-        child_enabled = st.checkbox(
-            "자녀 동반 여행", value=False, key="trip_child_enabled_v622",
-            help="동행 유형과 관계없이 자녀 인원과 연령을 일정 추천에 반영합니다.",
-        )
-        child_count = st.number_input(
-            "자녀 수", min_value=1, max_value=10,
-            value=1, step=1, key="trip_child_count_v622",
-            disabled=not child_enabled,
-            help="자녀 동반을 선택하면 1~10명과 자녀별 연령을 설정할 수 있습니다.",
-        )
 
-    pet_enabled = st.checkbox(
-        "반려견 동반 여행", value=False, key="trip_pet_enabled_v621",
-        help="반려견 동반 관련 키워드로 관광지·음식점·카페를 검색합니다. 실제 출입 가능 여부는 장소에 직접 확인해야 합니다.",
-    )
-    if pet_enabled:
-        st.caption("반려견 관련 장소를 우선 추천합니다. 관련 정보가 없는 일반 장소는 '동반 여부 미확인'으로 취급하며, 실제 출입 가능 여부를 방문 전 확인해야 합니다.")
+def _chat_632_validate(question: dict, raw: str) -> tuple[str|None,str]:
+    key=question["key"]
+    answer=raw.strip()
+    if key=="destination":
+        return (answer,None) if answer else (None,"여행지 이름을 입력해 주세요.")
+    if key in ("days","child_count"):
+        try: number=int(answer.replace("일","").replace("명",""))
+        except ValueError: return None,"숫자로 입력해 주세요."
+        limit=MAX_TRAVEL_DAYS if key=="days" else 10
+        if not 1<=number<=limit: return None,f"1~{limit} 사이로 입력해 주세요."
+        return str(number),""
+    if key in ("arrival","departure","middle_start","middle_end"):
+        try:
+            hour=int(answer.split(":")[0]); minute=int(answer.split(":")[1]) if ":" in answer else 0
+        except (ValueError,IndexError): return None,"예: 13:00 형식으로 입력해 주세요."
+        bounds={"arrival":(7,22),"departure":(8,23),"middle_start":(7,12),"middle_end":(16,23)}
+        low,high=bounds[key]
+        if not(low<=hour<=high and minute==0): return None,f"{low:02d}:00~{high:02d}:00 범위에서 정시로 입력해 주세요."
+        return f"{hour:02d}:00",""
+    if key=="lodging":
+        return answer or "아직 정하지 않았어요",""
+    if answer not in question["options"]:
+        return None,"제시된 선택지 중 하나를 선택해 주세요. 자유 입력은 여행지·일수·시간·숙소에 사용할 수 있습니다."
+    return answer,""
 
-    st.markdown("#### 여행 일정 시간 조건")
-    timing1, timing2, timing3 = st.columns(3, gap="medium")
-    with timing1:
-        st.selectbox("여행 속도", ["여유롭게", "보통", "빠르게"],
-                     index=1, key="trip_617_pace")
-    with timing2:
-        st.selectbox("첫날 여행지 도착 예정 시각", list(range(7, 23)),
-                     index=6, format_func=lambda h: f"{h:02d}:00", key="trip_618_arrival")
-    with timing3:
-        st.selectbox("마지막 날 귀가 출발 예정 시각", list(range(8, 24)),
-                     index=7, format_func=lambda h: f"{h:02d}:00", key="trip_618_departure")
-    timing4, timing5 = st.columns(2, gap="medium")
-    with timing4:
-        st.selectbox("중간 날짜 출발 시각", list(range(7, 13)),
-                     index=2, format_func=lambda h: f"{h:02d}:00", key="trip_617_start")
-    with timing5:
-        st.selectbox("중간 날짜 종료 희망 시각", list(range(16, 24)),
-                     index=4, format_func=lambda h: f"{h:02d}:00", key="trip_617_end")
-    # 호텔 규정은 숙소마다 다르므로 기본 시각만 제시합니다.
-    st.session_state.setdefault("trip_624_checkin", 15.0)
-    st.session_state.setdefault("trip_624_checkout", 11)
-    st.caption("숙소 체크인 기본 15:00 · 체크아웃 기본 11:00. 실제 체크인한 시간은 검색 후 여행 일정 관리에서 입력할 수 있습니다.")
 
-    # 6-23: 숙소를 여행 검색 전에 입력하면 최초 일정 생성 시 권역 선택에 반영합니다.
-    lodging_query_input = ""
-    if int(travel_days) > 1:
-        with st.expander("숙소를 정했다면 위치를 입력해 주세요 (선택)", expanded=True):
-            lodging_query_input = st.text_input(
-                "예약한 숙소 이름 또는 주소",
-                key="trip_623_lodging_query",
-                placeholder="예: 서귀포 ○○호텔 / 제주 애월읍 ○○펜션",
-                help="숙소 검색 결과에서 정확한 장소를 선택하고 일정을 생성합니다.",
+# 화면 모드는 전환해도 검색 결과를 삭제하지 않습니다.
+st.session_state.setdefault("trip_632_mode", "대화형 검색")
+search_mode = st.radio("검색 방식", ["대화형 검색","기존 상세 검색"], horizontal=True, key="trip_632_mode")
+
+# 기존 검색 엔진에서 사용하는 입력 변수 기본값
+submitted=False
+destination_query=""; party=TRAVEL_PARTIES[0]; travel_days=2
+duration=days_to_duration(2); transport=TRANSPORT_MODES[0]
+travel_style=STYLE_NAMES[0]; child_ages=[]; pet_enabled=False
+lodging_query_input=""; content_period=PERIOD_OPTIONS[1] if len(PERIOD_OPTIONS)>1 else PERIOD_OPTIONS[0]
+video_order=VIDEO_ORDER_OPTIONS[0]; child_group=None; child_age=None
+companion=companion_for_media(party,None)
+
+if search_mode == "기존 상세 검색":
+    # PC에서는 3열 × 2행 균등 배열, 모바일에서는 한 열로 표시합니다.
+    # 자녀 동반 여부는 여행 동행 유형과 무관하게 독립적으로 선택합니다.
+    with st.container():
+        row1_destination, row1_party, row1_days = st.columns(3, gap="medium")
+        with row1_destination:
+            destination_query = st.text_input(
+                "여행지",
+                placeholder="예: 서울, 경기 용인시, 제주 애월읍, 불국사",
+                help="지역명이나 관광지명을 입력하면 TourAPI와 카카오 로컬 API에서 검색합니다.",
             )
-            st.caption("숙소 주변 권역을 우선 고려합니다. 실제 도로 경로·체크인 시간·예약 상태는 확인하지 않습니다.")
+        with row1_party:
+            party = st.selectbox("누구와 여행하나요?", TRAVEL_PARTIES)
+        with row1_days:
+            travel_days = st.number_input(
+                "여행 일수 (직접 선택)",
+                min_value=1,
+                max_value=MAX_TRAVEL_DAYS,
+                value=2,
+                step=1,
+                help="1~30일 중 선택하세요. 1일은 당일치기, 5일은 4박 5일로 표시됩니다.",
+            )
+            duration = days_to_duration(int(travel_days))
 
-    child_ages = []
-    if child_enabled and int(child_count) > 0:
-        st.markdown("**자녀별 연령 선택**")
-        age_columns = st.columns(3, gap="medium")
-        for idx in range(int(child_count)):
-            with age_columns[idx % 3]:
-                age = st.selectbox(
-                    f"자녀 {idx + 1} 연령", CHILD_AGE_OPTIONS,
-                    key=f"trip_child_age_{idx}_v66",
+        # 6-30: 여행 시간 조건은 여행지 검색 전에 한 번만 설정합니다.
+        row2_transport, row2_style, row2_child = st.columns(3, gap="medium")
+        with row2_transport:
+            transport = st.selectbox("이동 수단", TRANSPORT_MODES)
+        with row2_style:
+            travel_style_primary = st.selectbox("주요 여행 스타일", STYLE_NAMES, key="trip_style_primary_v614")
+            travel_style_secondary = st.selectbox(
+                "보조 여행 스타일 (선택)",
+                ("선택 안 함",) + tuple(s for s in STYLE_NAMES if s != travel_style_primary),
+                key="trip_style_secondary_v614",
+                help="선택하지 않으면 기존 단일 스타일로 일정이 만들어집니다.",
+            )
+            travel_style = (travel_style_primary if travel_style_secondary == "선택 안 함"
+                            else travel_style_primary + " + " + travel_style_secondary)
+        with row2_child:
+            child_enabled = st.checkbox(
+                "자녀 동반 여행", value=False, key="trip_child_enabled_v622",
+                help="동행 유형과 관계없이 자녀 인원과 연령을 일정 추천에 반영합니다.",
+            )
+            child_count = st.number_input(
+                "자녀 수", min_value=1, max_value=10,
+                value=1, step=1, key="trip_child_count_v622",
+                disabled=not child_enabled,
+                help="자녀 동반을 선택하면 1~10명과 자녀별 연령을 설정할 수 있습니다.",
+            )
+
+        pet_enabled = st.checkbox(
+            "반려견 동반 여행", value=False, key="trip_pet_enabled_v621",
+            help="반려견 동반 관련 키워드로 관광지·음식점·카페를 검색합니다. 실제 출입 가능 여부는 장소에 직접 확인해야 합니다.",
+        )
+        if pet_enabled:
+            st.caption("반려견 관련 장소를 우선 추천합니다. 관련 정보가 없는 일반 장소는 '동반 여부 미확인'으로 취급하며, 실제 출입 가능 여부를 방문 전 확인해야 합니다.")
+
+        st.markdown("#### 여행 일정 시간 조건")
+        timing1, timing2, timing3 = st.columns(3, gap="medium")
+        with timing1:
+            st.selectbox("여행 속도", ["여유롭게", "보통", "빠르게"],
+                         index=1, key="trip_617_pace")
+        with timing2:
+            st.selectbox("첫날 여행지 도착 예정 시각", list(range(7, 23)),
+                         index=6, format_func=lambda h: f"{h:02d}:00", key="trip_618_arrival")
+        with timing3:
+            st.selectbox("마지막 날 귀가 출발 예정 시각", list(range(8, 24)),
+                         index=7, format_func=lambda h: f"{h:02d}:00", key="trip_618_departure")
+        timing4, timing5 = st.columns(2, gap="medium")
+        with timing4:
+            st.selectbox("중간 날짜 출발 시각", list(range(7, 13)),
+                         index=2, format_func=lambda h: f"{h:02d}:00", key="trip_617_start")
+        with timing5:
+            st.selectbox("중간 날짜 종료 희망 시각", list(range(16, 24)),
+                         index=4, format_func=lambda h: f"{h:02d}:00", key="trip_617_end")
+        # 호텔 규정은 숙소마다 다르므로 기본 시각만 제시합니다.
+        st.session_state.setdefault("trip_624_checkin", 15.0)
+        st.session_state.setdefault("trip_624_checkout", 11)
+        st.caption("숙소 체크인 기본 15:00 · 체크아웃 기본 11:00. 실제 체크인한 시간은 검색 후 여행 일정 관리에서 입력할 수 있습니다.")
+
+        # 6-23: 숙소를 여행 검색 전에 입력하면 최초 일정 생성 시 권역 선택에 반영합니다.
+        lodging_query_input = ""
+        if int(travel_days) > 1:
+            with st.expander("숙소를 정했다면 위치를 입력해 주세요 (선택)", expanded=True):
+                lodging_query_input = st.text_input(
+                    "예약한 숙소 이름 또는 주소",
+                    key="trip_623_lodging_query",
+                    placeholder="예: 서귀포 ○○호텔 / 제주 애월읍 ○○펜션",
+                    help="숙소 검색 결과에서 정확한 장소를 선택하고 일정을 생성합니다.",
                 )
-                child_ages.append(age)
-        st.caption("여러 연령대가 함께 즐길 수 있는 관광지를 우선 추천합니다. 실제 입장·관람 연령 제한은 방문 전 확인하세요.")
+                st.caption("숙소 주변 권역을 우선 고려합니다. 실제 도로 경로·체크인 시간·예약 상태는 확인하지 않습니다.")
 
-    st.caption(f"선택한 여행 기간: {duration}")
-    with st.expander("후기 · 영상 상세 옵션", expanded=False):
-        advanced_left, advanced_right = st.columns(2, gap="medium")
-        with advanced_left:
-            content_period = st.selectbox("후기·영상 기간", PERIOD_OPTIONS, index=1)
-        with advanced_right:
-            video_order = st.selectbox("YouTube 정렬", VIDEO_ORDER_OPTIONS)
+        child_ages = []
+        if child_enabled and int(child_count) > 0:
+            st.markdown("**자녀별 연령 선택**")
+            age_columns = st.columns(3, gap="medium")
+            for idx in range(int(child_count)):
+                with age_columns[idx % 3]:
+                    age = st.selectbox(
+                        f"자녀 {idx + 1} 연령", CHILD_AGE_OPTIONS,
+                        key=f"trip_child_age_{idx}_v66",
+                    )
+                    child_ages.append(age)
+            st.caption("여러 연령대가 함께 즐길 수 있는 관광지를 우선 추천합니다. 실제 입장·관람 연령 제한은 방문 전 확인하세요.")
 
-    child_groups = list(dict.fromkeys(child_age_bucket(age) for age in child_ages))
-    child_group = ", ".join(child_groups) if child_groups else None
-    companion = companion_for_media(party, child_group)
-    child_age = child_groups[0] if len(child_groups) == 1 else None
-    submitted = st.button("여행지 검색", type="primary", use_container_width=True)
+        st.caption(f"선택한 여행 기간: {duration}")
+        with st.expander("후기 · 영상 상세 옵션", expanded=False):
+            advanced_left, advanced_right = st.columns(2, gap="medium")
+            with advanced_left:
+                content_period = st.selectbox("후기·영상 기간", PERIOD_OPTIONS, index=1)
+            with advanced_right:
+                video_order = st.selectbox("YouTube 정렬", VIDEO_ORDER_OPTIONS)
+
+        child_groups = list(dict.fromkeys(child_age_bucket(age) for age in child_ages))
+        child_group = ", ".join(child_groups) if child_groups else None
+        companion = companion_for_media(party, child_group)
+        child_age = child_groups[0] if len(child_groups) == 1 else None
+        submitted = st.button("여행지 검색", type="primary", use_container_width=True)
+else:
+    st.session_state.setdefault("trip_632_answers", {})
+    answers=st.session_state.trip_632_answers
+    questions=_chat_632_questions(answers)
+    st.markdown("#### 대화형 여행 플래너")
+    st.caption("질문에 답하거나 직접 입력해 여행 조건을 완성하세요. 유료 AI API는 사용하지 않습니다.")
+    st.progress(min(1.0,len(answers)/max(1,len(questions))))
+    for item in questions:
+        if item["key"] not in answers: break
+        with st.chat_message("assistant"):
+            st.write(item["prompt"])
+        with st.chat_message("user"):
+            st.write(answers[item["key"]])
+    current=next((q for q in questions if q["key"] not in answers),None)
+    if current:
+        with st.chat_message("assistant"):
+            st.write(current["prompt"])
+            if current.get("hint"): st.caption(current["hint"])
+        with st.form("trip_632_question_form",clear_on_submit=True):
+            options=current["options"]
+            if options:
+                choice=st.selectbox("추천 답변",["직접 입력"]+options,key=f"trip_632_choice_{current['key']}")
+            else: choice="직접 입력"
+            typed=st.text_input("직접 입력" if choice=="직접 입력" else "다른 답변 입력 (선택)",
+                                key=f"trip_632_text_{current['key']}")
+            next_clicked=st.form_submit_button("답변하고 다음 질문",type="primary",use_container_width=True)
+        if next_clicked:
+            raw=typed if typed.strip() else (choice if choice!="직접 입력" else "")
+            normalized,error=_chat_632_validate(current,raw)
+            if error: st.warning(error)
+            else:
+                answers[current["key"]]=normalized
+                st.session_state.trip_632_answers=answers
+                st.rerun()
+    else:
+        st.success("여행 조건이 완성됐습니다. 확인 후 여행 일정을 생성하세요.")
+        st.json({q["prompt"]:answers[q["key"]] for q in questions},expanded=False)
+        submitted=st.button("이 조건으로 여행 일정 만들기",type="primary",use_container_width=True)
+    back_col,reset_col=st.columns(2)
+    with back_col:
+        if st.button("이전 질문",disabled=not bool(answers),use_container_width=True):
+            last=next((q["key"] for q in reversed(questions) if q["key"] in answers),None)
+            if last:
+                # Backtracking clears the last answer and any conditional descendants.
+                old_order=[q["key"] for q in questions]
+                cut=old_order.index(last)
+                st.session_state.trip_632_answers={k:v for k,v in answers.items() if k in old_order[:cut]}
+                st.rerun()
+    with reset_col:
+        if st.button("대화 처음부터",use_container_width=True):
+            st.session_state.trip_632_answers={}
+            st.rerun()
+    if submitted:
+        destination_query=answers["destination"]
+        party=answers["party"]
+        travel_days=int(answers["days"])
+        duration=days_to_duration(travel_days)
+        transport=answers["transport"]
+        primary=answers["primary"]; secondary=answers["secondary"]
+        travel_style=primary if secondary in ("선택 안 함",primary) else primary+" + "+secondary
+        child_ages=[answers[f"age_{i}"] for i in range(int(answers.get("child_count",0)))] if answers["children"]=="예" else []
+        pet_enabled=answers["pet"]=="예"
+        lodging_query_input=answers.get("lodging","")
+        if lodging_query_input=="아직 정하지 않았어요": lodging_query_input=""
+        st.session_state["trip_617_pace"]=answers["pace"]
+        st.session_state["trip_618_arrival"]=int(answers["arrival"].split(":")[0])
+        st.session_state["trip_618_departure"]=int(answers["departure"].split(":")[0])
+        st.session_state["trip_617_start"]=int(answers.get("middle_start","09:00").split(":")[0])
+        st.session_state["trip_617_end"]=int(answers.get("middle_end","20:00").split(":")[0])
+        st.session_state.setdefault("trip_624_checkin",15.0)
+        st.session_state.setdefault("trip_624_checkout",11)
+        child_groups=list(dict.fromkeys(child_age_bucket(age) for age in child_ages))
+        child_group=", ".join(child_groups) if child_groups else None
+        child_age=child_groups[0] if len(child_groups)==1 else None
+        companion=companion_for_media(party,child_group)
 
 if "search_result" not in st.session_state:
     st.session_state.search_result = None
